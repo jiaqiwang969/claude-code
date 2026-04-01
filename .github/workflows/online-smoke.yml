@@ -1,0 +1,50 @@
+name: Online Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      checks:
+        description: Comma-separated online smoke checks
+        required: false
+        default: api-basic,claude-md-context,bash-tool,read-tool,write-tool,edit-tool,notebook-edit-tool,grep-tool,glob-tool,agent-flow,webfetch-tool,websearch-tool,mcp-flow,mcp-http-auth-flow,mcp-http-headers-helper-flow,compact-flow,resume-flow
+      model:
+        description: Model passed to the smoke harness
+        required: false
+        default: claude-sonnet-4-6
+      max_budget_usd:
+        description: Per-check budget cap
+        required: false
+        default: "0.20"
+
+jobs:
+  online-smoke:
+    runs-on: ubuntu-latest
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Check secrets
+        run: |
+          if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "::error::Set ANTHROPIC_API_KEY in repository secrets before running online smoke."
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build
+        run: bun run build
+
+      - name: Run online smoke
+        env:
+          SMOKE_MODEL: ${{ inputs.model }}
+          SMOKE_MAX_BUDGET_USD: ${{ inputs.max_budget_usd }}
+        run: bun run smoke -- --online --checks "${{ inputs.checks }}"

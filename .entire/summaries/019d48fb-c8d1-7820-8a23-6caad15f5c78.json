@@ -1,0 +1,8 @@
+{
+  "is_meaningful": true,
+  "motivation": "User needed to install/compile/run the forked Claude CLI and connect it to a custom API proxy by setting a key/base URL in a default location (preferably `~/.claude`) without modifying project code.",
+  "approach": "Chose the repo-supported user config mechanism (`~/.claude/settings.json` -> `settings.env`) to inject `ANTHROPIC_API_KEY` and `ANTHROPIC_BASE_URL`, because the CLI loads these early via `managedEnv` and it avoids patching source/build scripts. Validated by building/running the CLI and issuing a real request through the configured endpoint.",
+  "challenges": "Misconfigured `ANTHROPIC_BASE_URL` with a `/v1` suffix caused requests to hit `/v1/v1/messages`; fixed by using the root host URL (no `/v1`). A second provided endpoint (`lingkong.xyz`) returned 502s and was rejected based on direct curl verification.",
+  "tradeoffs": "Persisting credentials in user-level config enabled immediate usability without code changes, but requires careful secret handling (avoid committing keys to git) and accepts that some endpoints may be unreliable (validated via live requests).",
+  "outcome": "Confirmed the correct configuration path and environment wiring, successfully ran the CLI against the working proxy endpoint, and documented the key insight that the base URL must be the root (SDK appends `/v1`). Also assessed project maturity from README + commit history: V3 is usable/buildable with active docs/fixes, but testing/stub cleanup suggests it’s pre-V4 stabilization rather than a hardened release."
+}

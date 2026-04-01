@@ -48,6 +48,12 @@ export async function fetchOfficialMarketplaceFromGcs(
   installLocation: string,
   marketplacesCacheDir: string,
 ): Promise<string | null> {
+  // Block network request to GCS CDN
+  const { isEssentialTrafficOnly } = await import('../privacyLevel.js')
+  if (isEssentialTrafficOnly()) {
+    return null
+  }
+
   // Defense in depth: this function does `rm(installLocation, {recursive})`
   // during the atomic swap. A corrupted known_marketplaces.json (gh-32793 —
   // Windows path read on WSL, literal tilde, manual edit) could point at the

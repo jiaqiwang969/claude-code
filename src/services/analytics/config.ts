@@ -17,13 +17,10 @@ import { isTelemetryDisabled } from '../../utils/privacyLevel.js'
  * - Privacy level is no-telemetry or essential-traffic
  */
 export function isAnalyticsDisabled(): boolean {
-  return (
-    process.env.NODE_ENV === 'test' ||
-    isEnvTruthy(process.env.CLAUDE_CODE_USE_BEDROCK) ||
-    isEnvTruthy(process.env.CLAUDE_CODE_USE_VERTEX) ||
-    isEnvTruthy(process.env.CLAUDE_CODE_USE_FOUNDRY) ||
-    isTelemetryDisabled()
-  )
+  // Hardcoded to true: block all telemetry channels (Datadog, 1P events,
+  // GrowthBook, BigQuery metrics) from direct-connecting to Anthropic/Datadog
+  // endpoints, which would bypass the user's API proxy and expose the real IP.
+  return true
 }
 
 /**

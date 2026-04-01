@@ -58,6 +58,33 @@ bun run build
 
 如果遇到 bug 请直接提一个 issues, 我们优先解决
 
+## 工程状态与验证
+
+当前仓库已经补了一层“源码审计 + smoke 回归”的治理基座，用来区分“目录里有代码”和“主路径真的可用”：
+
+- 完成度矩阵：[`docs/COMPLETENESS_MATRIX.md`](docs/COMPLETENESS_MATRIX.md)
+- 偏离清单：[`docs/DIVERGENCE.md`](docs/DIVERGENCE.md)
+- 离线 smoke：`bun run smoke`
+- 在线 smoke：`bun run smoke:online`
+- Chrome readiness：`bun run smoke -- --checks chrome-readiness`
+- Chrome runtime smoke：`bun run smoke -- --checks chrome-smoke`
+- Chrome 辅助脚本：`bun run claude-in-chrome:open-extension` / `bun run claude-in-chrome:install-host` / `bun run claude-in-chrome:check` / `bun run claude-in-chrome:ping-host` / `bun run claude-in-chrome:download-extension` / `bun run claude-in-chrome:launch-unpacked` / `bun run claude-in-chrome:smoke`
+- 只跑部分在线检查：`bun run smoke -- --online --checks api-basic,claude-md-context,bash-tool,read-tool,write-tool,edit-tool,notebook-edit-tool,grep-tool,glob-tool,agent-flow,webfetch-tool,websearch-tool,mcp-flow,mcp-http-auth-flow,mcp-http-headers-helper-flow,compact-flow,resume-flow`
+- GitHub Actions：`.github/workflows/ci.yml` 会跑离线 smoke；`.github/workflows/online-smoke.yml` 支持手动触发在线 smoke
+
+说明：
+
+- README 下方“能力清单”更偏向源码表面盘点，不等于所有模块都已经做过端到端验证。
+- 真实完成度、优先级和已知偏离，请以完成度矩阵和偏离清单为准。
+- 新增或修复一个模块时，建议同步更新矩阵，并至少补一条 smoke 或回归验证。
+- 多步工具 smoke 默认预算上限为 `$0.20`，低于这个值时可能会出现“工具已经跑完，但预算上限过低导致误报”的情况。
+- 当前离线 smoke 已覆盖 `doctor` 诊断屏渲染；在线 smoke 已覆盖 `CLAUDE.md` 自动上下文、`Agent/Task`、`NotebookEdit` 最小 notebook 单元替换、`WebFetch` 公开静态页抓取、`WebSearch` 结构化搜索结果回传、MCP 本地 stdio 资源读取、MCP HTTP + 静态 `Authorization` header 鉴权资源读取、MCP HTTP + `headersHelper` 鉴权资源读取、`/compact`、`--continue` 和 `--resume <session-id>` 的恢复路径。
+- 当前 smoke harness 额外支持 `chrome-readiness` 本机诊断；若浏览器、扩展或 live native socket 未准备好，会以 `skip` 而不是误报代码失败。
+- 浏览器特化 MCP（Claude in Chrome）的 workspace package 已从相邻 restored source 回填，源码层不再是 stub；当前 fork 还补上了 native host 安装/诊断/最小 smoke 脚本（`scripts/install-claude-in-chrome-host.ts`、`scripts/claude-in-chrome-check.ts`、`scripts/claude-in-chrome-smoke.ts`），本机侧已可自动安装 wrapper + manifest。
+- 额外补了一条“官方 CRX 下载 -> 固定目录解包 -> 直启 Chrome”的实验辅助路径（`scripts/download-claude-in-chrome-extension.ts`、`scripts/launch-claude-in-chrome-unpacked.ts`）以及离线 host `ping/pong` 自检（`scripts/claude-in-chrome-ping-host.ts`）。当前验证结果是：host 自检已通过，官方 CRX 可稳定解包并直启 Chrome，但 live socket 仍未稳定出现，因此剩余问题已经收敛到浏览器运行时/登录/扩展内部状态，而不是源码 stub 或 native host 缺失。
+- `WebSearch` smoke 只断言“工具被调起并返回结构化 hits”，不把外部搜索排序或模型最终自由生成回答当成稳定快照。
+- `/memory` 命令本身是 `local-jsx` 交互式编辑器，不属于稳定的 headless smoke 面；不要把它和运行时的 CLAUDE.md / memory 上下文加载混为一谈。
+
 ## 相关文档及网站
 
 <https://deepwiki.com/claude-code-best/claude-code>

@@ -26,13 +26,8 @@ import { getGlobalConfig } from './config.js'
 import { isEnvTruthy } from './envUtils.js'
 
 export function isUndercover(): boolean {
-  if (process.env.USER_TYPE === 'ant') {
-    if (isEnvTruthy(process.env.CLAUDE_CODE_UNDERCOVER)) return true
-    // Auto: active unless we've positively confirmed we're in an allowlisted
-    // internal repo. 'external', 'none', and null (check not yet run) all
-    // resolve to ON. The check is primed in setup.ts; only 'internal' → OFF.
-    return getRepoClassCached() !== 'internal'
-  }
+  // Disabled — we're not Anthropic employees, undercover mode just strips
+  // useful attribution (Co-Authored-By) and hides model identity from prompts.
   return false
 }
 

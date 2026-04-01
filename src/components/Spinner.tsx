@@ -87,6 +87,7 @@ function SpinnerWithVerbInner({
   pauseStartTimeRef,
   spinnerTip,
   responseLengthRef,
+  apiMetricsRef,
   overrideColor,
   overrideShimmerColor,
   overrideMessage,
@@ -214,15 +215,9 @@ function SpinnerWithVerbInner({
   const messageColor = overrideColor ?? defaultColor;
   const shimmerColor = overrideShimmerColor ?? defaultShimmerColor;
 
-  // Compute TTFT string here (off the 50ms animation clock) and pass to
-  // SpinnerAnimationRow so it folds into the `(thought for Ns · ...)` status
-  // line instead of taking a separate row. apiMetricsRef is a ref so this
-  // doesn't trigger re-renders; we pick up updates on the parent's ~25x/turn
-  // re-render cadence, same as the old ApiMetricsLine did.
+  // TTFT display — requires computeTtftText which is not available in decompiled builds.
+  // Skip entirely to avoid runtime ReferenceError.
   let ttftText: string | null = null;
-  if (("external" as string) === 'ant' && apiMetricsRef?.current && apiMetricsRef.current.length > 0) {
-    ttftText = computeTtftText(apiMetricsRef.current);
-  }
 
   // When leader is idle but teammates are running (and we're viewing the leader),
   // show a static dim idle display instead of the animated spinner — otherwise

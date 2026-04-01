@@ -257,11 +257,21 @@ export async function autoCompactIfNeeded(
   // Circuit breaker: stop retrying after N consecutive failures.
   // Without this, sessions where context is irrecoverably over the limit
   // hammer the API with doomed compaction attempts on every turn.
+  // Optimization: allow a "probe" retry every 10 turns after tripping,
+  // because context structure may change as the user continues chatting.
   if (
     tracking?.consecutiveFailures !== undefined &&
     tracking.consecutiveFailures >= MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES
   ) {
-    return { wasCompacted: false }
+    const turnsSinceTrip = tracking?.turnCounter ?? 0
+    if (turnsSinceTrip < 10) {
+      return { wasCompacted: false }
+    }
+    // Allow one probe attempt after 10 turns
+    logForDebugging(
+      `autocompact: circuit breaker probe after ${turnsSinceTrip} turns — retrying once`,
+      { level: 'info' },
+    )
   }
 
   const model = toolUseContext.options.mainLoopModel

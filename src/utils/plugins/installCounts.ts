@@ -223,6 +223,12 @@ async function fetchInstallCountsFromGitHub(): Promise<
  * @returns Map of plugin ID (name@marketplace) to install count, or null if unavailable
  */
 export async function getInstallCounts(): Promise<Map<string, number> | null> {
+  // Block network request to GitHub stats endpoint
+  const { isEssentialTrafficOnly } = await import('../privacyLevel.js')
+  if (isEssentialTrafficOnly()) {
+    return null
+  }
+
   // Try to load from cache first
   const cache = await loadInstallCountsCache()
   if (cache) {

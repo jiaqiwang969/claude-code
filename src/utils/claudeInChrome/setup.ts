@@ -1,4 +1,5 @@
 import { BROWSER_TOOLS } from '@ant/claude-for-chrome-mcp'
+import { existsSync } from 'fs'
 import { chmod, mkdir, readFile, writeFile } from 'fs/promises'
 import { homedir } from 'os'
 import { join } from 'path'
@@ -28,6 +29,10 @@ import {
   getAllWindowsRegistryKeys,
   openInChrome,
 } from './common.js'
+import {
+  hasClaudeInChromeMcpImplementation,
+  requireClaudeInChromeMcpImplementation,
+} from './packageBoundary.js'
 import { getChromeSystemPrompt } from './prompt.js'
 import { isChromeExtensionInstalledPortable } from './setupPortable.js'
 
@@ -75,6 +80,7 @@ export function shouldAutoEnableClaudeInChrome(): boolean {
   }
 
   shouldAutoEnable =
+    hasClaudeInChromeMcpImplementation() &&
     getIsInteractive() &&
     isChromeExtensionInstalled_CACHED_MAY_BE_STALE() &&
     (process.env.USER_TYPE === 'ant' ||
@@ -93,6 +99,8 @@ export function setupClaudeInChrome(): {
   allowedTools: string[]
   systemPrompt: string
 } {
+  requireClaudeInChromeMcpImplementation()
+
   const isNativeBuild = isInBundledMode()
   const allowedTools = BROWSER_TOOLS.map(
     tool => `mcp__claude-in-chrome__${tool.name}`,
@@ -110,10 +118,7 @@ export function setupClaudeInChrome(): {
     const execCommand = `"${process.execPath}" --chrome-native-host`
 
     // Run asynchronously without blocking; best-effort so swallow errors
-    void createWrapperScript(execCommand)
-      .then(manifestBinaryPath =>
-        installChromeNativeHostManifest(manifestBinaryPath),
-      )
+    void installChromeNativeHostSupport(execCommand)
       .catch(e =>
         logForDebugging(
           `[Claude in Chrome] Failed to install native host: ${e}`,
@@ -135,16 +140,10 @@ export function setupClaudeInChrome(): {
       systemPrompt: getChromeSystemPrompt(),
     }
   } else {
-    const __filename = fileURLToPath(import.meta.url)
-    const __dirname = join(__filename, '..')
-    const cliPath = join(__dirname, 'cli.js')
+    const cliCommand = resolveChromeNativeHostCommand()
+    const cliPath = extractCliPathFromChromeNativeHostCommand(cliCommand)
 
-    void createWrapperScript(
-      `"${process.execPath}" "${cliPath}" --chrome-native-host`,
-    )
-      .then(manifestBinaryPath =>
-        installChromeNativeHostManifest(manifestBinaryPath),
-      )
+    void installChromeNativeHostSupport(cliCommand)
       .catch(e =>
         logForDebugging(
           `[Claude in Chrome] Failed to install native host: ${e}`,
@@ -168,6 +167,50 @@ export function setupClaudeInChrome(): {
       systemPrompt: getChromeSystemPrompt(),
     }
   }
+}
+
+export function resolveChromeNativeHostCommand({
+  modulePath = fileURLToPath(import.meta.url),
+  execPath = process.execPath,
+  pathExists = existsSync,
+}: {
+  modulePath?: string
+  execPath?: string
+  pathExists?: (path: string) => boolean
+} = {}): string {
+  const currentDir = join(modulePath, '..')
+  const candidateCliPaths = [
+    join(currentDir, 'cli.js'),
+    join(currentDir, '..', '..', '..', 'dist', 'cli.js'),
+    join(currentDir, '..', '..', 'entrypoints', 'cli.tsx'),
+  ]
+
+  const cliPath = candidateCliPaths.find(pathExists)
+  if (!cliPath) {
+    throw Error(
+      `Claude in Chrome CLI entrypoint not found. Checked: ${candidateCliPaths.join(', ')}`
+    )
+  }
+
+  return `"${execPath}" "${cliPath}" --chrome-native-host`
+}
+
+export async function installChromeNativeHostSupport(
+  command: string,
+): Promise<string> {
+  const manifestBinaryPath = await createWrapperScript(command)
+  await installChromeNativeHostManifest(manifestBinaryPath)
+  return manifestBinaryPath
+}
+
+function extractCliPathFromChromeNativeHostCommand(command: string): string {
+  const match = command.match(/^"[^"]+" "([^"]+)" --chrome-native-host$/)
+  if (!match) {
+    throw Error(
+      `Unable to extract Claude in Chrome CLI path from command: ${command}`
+    )
+  }
+  return match[1]!
 }
 
 /**

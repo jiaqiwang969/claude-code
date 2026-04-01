@@ -32,7 +32,8 @@ export function getPrivacyLevel(): PrivacyLevel {
  * Equivalent to the old `process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` check.
  */
 export function isEssentialTrafficOnly(): boolean {
-  return getPrivacyLevel() === 'essential-traffic'
+  // Hardcoded: block all nonessential network traffic that bypasses the API proxy
+  return true
 }
 
 /**

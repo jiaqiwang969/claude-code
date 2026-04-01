@@ -135,6 +135,7 @@ import { markClaudeAiMcpConnected } from './claudeai.js'
 import { getAllMcpConfigs, isMcpServerDisabled } from './config.js'
 import { getMcpServerHeaders } from './headersHelper.js'
 import { SdkControlClientTransport } from './SdkControlTransport.js'
+import { requireInProcessMcpServer } from './inProcessServerBoundary.js'
 import type {
   ConnectedMCPServer,
   MCPServerConnection,
@@ -918,7 +919,11 @@ export const connectToServer = memoize(
           './InProcessTransport.js'
         )
         const context = createChromeContext((serverRef as McpStdioServerConfig).env)
-        inProcessServer = createClaudeForChromeMcpServer(context)
+        inProcessServer = requireInProcessMcpServer(
+          name,
+          createClaudeForChromeMcpServer(context),
+          '@ant/claude-for-chrome-mcp',
+        )
         const [clientTransport, serverTransport] = createLinkedTransportPair()
         await inProcessServer.connect(serverTransport)
         transport = clientTransport

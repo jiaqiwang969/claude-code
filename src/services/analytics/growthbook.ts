@@ -735,6 +735,15 @@ export function getFeatureValue_CACHED_MAY_BE_STALE<T>(
   feature: string,
   defaultValue: T,
 ): T {
+  // Memory system defaults — hardcoded to bypass GrowthBook for decompiled builds
+  const memorySystemDefaults: Record<string, unknown> = {
+    'tengu_passport_quail': true,
+    'tengu_onyx_plover': { enabled: true, minHours: 24, minSessions: 5 },
+  }
+  if (feature in memorySystemDefaults) {
+    return memorySystemDefaults[feature] as T
+  }
+
   // Check env var overrides first (for eval harnesses)
   const overrides = getEnvOverrides()
   if (overrides && feature in overrides) {

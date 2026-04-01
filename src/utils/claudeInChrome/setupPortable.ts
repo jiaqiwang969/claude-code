@@ -32,6 +32,11 @@ export type BrowserPath = {
   path: string
 }
 
+type BrowserProfilePath = {
+  name: string
+  path: string
+}
+
 type Logger = (message: string) => void
 
 // Browser detection order - must match BROWSER_DETECTION_ORDER from common.ts
@@ -177,28 +182,32 @@ export async function detectExtensionInstallationPortable(
       .filter(
         entry => entry.name === 'Default' || entry.name.startsWith('Profile '),
       )
-      .map(entry => entry.name)
+      .map(entry => ({
+        name: entry.name,
+        path: join(browserBasePath, entry.name),
+      }))
 
-    if (profileDirs.length > 0) {
+    const profilePaths = getExtensionProfilePaths(
+      browser,
+      browserBasePath,
+      profileDirs,
+    )
+
+    if (profilePaths.length > 0) {
       log?.(
-        `[Claude in Chrome] Found ${browser} profiles: ${profileDirs.join(', ')}`,
+        `[Claude in Chrome] Found ${browser} profiles: ${profilePaths.map(profile => profile.name).join(', ')}`,
       )
     }
 
     // Check each profile for any of the extension IDs
-    for (const profile of profileDirs) {
+    for (const profile of profilePaths) {
       for (const extensionId of extensionIds) {
-        const extensionPath = join(
-          browserBasePath,
-          profile,
-          'Extensions',
-          extensionId,
-        )
+        const extensionPath = join(profile.path, 'Extensions', extensionId)
 
         try {
           await readdir(extensionPath)
           log?.(
-            `[Claude in Chrome] Extension ${extensionId} found in ${browser} ${profile}`,
+            `[Claude in Chrome] Extension ${extensionId} found in ${browser} ${profile.name}`,
           )
           return { isInstalled: true, browser }
         } catch {
@@ -210,6 +219,24 @@ export async function detectExtensionInstallationPortable(
 
   log?.(`[Claude in Chrome] Extension not found in any browser`)
   return { isInstalled: false, browser: null }
+}
+
+function getExtensionProfilePaths(
+  browser: ChromiumBrowser,
+  browserBasePath: string,
+  profileDirs: BrowserProfilePath[],
+): BrowserProfilePath[] {
+  if (profileDirs.length > 0) {
+    return profileDirs
+  }
+
+  // Opera stores Extensions directly under the browser root instead of
+  // using Chromium's Default/Profile N layout.
+  if (browser === 'opera') {
+    return [{ name: 'Root', path: browserBasePath }]
+  }
+
+  return []
 }
 
 /**

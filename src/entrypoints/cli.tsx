@@ -1,9 +1,12 @@
 #!/usr/bin/env bun
 // Runtime polyfill for bun:bundle (build-time macros)
-const feature = (_name: string) => false;
+const feature = (_name: string) => {
+  const enabled = new Set(['EXTRACT_MEMORIES']);
+  return enabled.has(_name);
+};
 if (typeof globalThis.MACRO === "undefined") {
     (globalThis as any).MACRO = {
-        VERSION: "2.1.888",
+        VERSION: "2.1.88",
         BUILD_TIME: new Date().toISOString(),
         FEEDBACK_CHANNEL: "",
         ISSUES_EXPLAINER: "",
@@ -20,6 +23,15 @@ if (typeof globalThis.MACRO === "undefined") {
 // Bugfix for corepack auto-pinning, which adds yarnpkg to peoples' package.jsons
 // eslint-disable-next-line custom-rules/no-top-level-side-effects
 process.env.COREPACK_ENABLE_AUTO_PIN = "0";
+
+// === USER_TYPE BYPASS ===
+// Inject USER_TYPE=ant to unlock internal features (294 checkpoints across codebase)
+// This enables: REPLTool, SuggestBackgroundPRTool, enhanced Agent models (Opus vs Haiku),
+// remote isolation, optimized prompts, extended Bash permissions, and internal skills.
+// eslint-disable-next-line custom-rules/no-top-level-side-effects, custom-rules/no-process-env-top-level
+if (!process.env.USER_TYPE) {
+    process.env.USER_TYPE = "ant";
+}
 
 // Set max heap size for child processes in CCR environments (containers have 16GB)
 // eslint-disable-next-line custom-rules/no-top-level-side-effects, custom-rules/no-process-env-top-level, custom-rules/safe-env-boolean-check

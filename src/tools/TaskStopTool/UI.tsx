@@ -25,7 +25,7 @@ export function renderToolResultMessage(output: Output, _progressMessagesForMess
 }: {
   verbose: boolean;
 }): React.ReactNode {
-  if (("external" as string) === 'ant') {
+  if ("ant" === 'ant') {
     return null;
   }
   const rawCommand = output.command ?? '';
