@@ -11,7 +11,13 @@ fi
 echo "Running Biome lint on staged files..."
 
 # 使用 biome lint 对暂存文件进行检查（仅 lint，不格式化，不自动修复）
-echo "$STAGED_FILES" | xargs bunx biome lint --no-errors-on-unmatched
+if ! command -v bun >/dev/null 2>&1; then
+  echo ""
+  echo "Biome lint failed: bun is not available in PATH."
+  exit 1
+fi
+
+echo "$STAGED_FILES" | xargs bun x biome lint --no-errors-on-unmatched
 
 if [ $? -ne 0 ]; then
   echo ""
