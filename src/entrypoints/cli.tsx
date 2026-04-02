@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 // Runtime polyfill for bun:bundle (build-time macros)
 const feature = (_name: string) => {
-  const enabled = new Set(['EXTRACT_MEMORIES']);
+  const enabled = new Set(['EXTRACT_MEMORIES', 'KAIROS', 'KAIROS_BRIEF', 'KAIROS_DREAM', 'KAIROS_PUSH_NOTIFICATION', 'KAIROS_GITHUB_WEBHOOKS', 'PROACTIVE']);
   return enabled.has(_name);
 };
 if (typeof globalThis.MACRO === "undefined") {
@@ -78,7 +78,6 @@ async function main(): Promise<void> {
         (args[0] === "--version" || args[0] === "-v" || args[0] === "-V")
     ) {
         // MACRO.VERSION is inlined at build time
-        // biome-ignore lint/suspicious/noConsole:: intentional console output
         console.log(`${MACRO.VERSION} (Claude Code)`);
         return;
     }
@@ -100,7 +99,6 @@ async function main(): Promise<void> {
             (modelIdx !== -1 && args[modelIdx + 1]) || getMainLoopModel();
         const { getSystemPrompt } = await import("../constants/prompts.js");
         const prompt = await getSystemPrompt([], model);
-        // biome-ignore lint/suspicious/noConsole:: intentional console output
         console.log(prompt.join("\n"));
         return;
     }

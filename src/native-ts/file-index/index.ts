@@ -203,9 +203,9 @@ export class FileIndex {
     const topK: { path: string; fuzzScore: number }[] = []
     let threshold = -Infinity
 
-    const { paths, lowerPaths, charBits, pathLens, readyCount } = this
+    const { paths, lowerPaths, charBits, pathLens } = this
 
-    outer: for (let i = 0; i < readyCount; i++) {
+    for (let i = 0; i < this.readyCount; i++) {
       // O(1) bitmap reject: path must contain every letter in the needle
       if ((charBits[i]! & needleBitmap) !== needleBitmap) continue
 

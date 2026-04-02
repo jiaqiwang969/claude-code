@@ -51,12 +51,15 @@ describe("colorToEscape", () => {
 		expect(colorToEscape(color, true, "truecolor")).toBe("\x1b[38;2;100;150;200m");
 	});
 
-	test("color256 uses 256-color escape", () => {
-		const color = { r: 100, g: 150, b: 200, a: 255 };
-		const result = colorToEscape(color, true, "color256");
-		expect(result).toMatch(/^\x1b\[38;5;\d+m$/);
+		test("color256 uses 256-color escape", () => {
+			const color = { r: 100, g: 150, b: 200, a: 255 };
+			const result = colorToEscape(color, true, "color256");
+			expect(result.startsWith("\x1b[38;5;")).toBe(true);
+			expect(result.endsWith("m")).toBe(true);
+			const paletteIndex = Number.parseInt(result.slice("\x1b[38;5;".length, -1), 10);
+			expect(Number.isNaN(paletteIndex)).toBe(false);
+		});
 	});
-});
 
 describe("detectColorMode", () => {
 	test("returns ansi for ansi-containing theme names", () => {

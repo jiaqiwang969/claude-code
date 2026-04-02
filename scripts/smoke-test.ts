@@ -1,10 +1,11 @@
 #!/usr/bin/env bun
 
+import { feature } from "bun:bundle";
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { chmod, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { stripVTControlCharacters } from "node:util";
 
 import { collectClaudeInChromeReadinessSummary } from "../src/utils/claudeInChrome/readiness.js";
@@ -39,6 +40,11 @@ type TerminalProbeResult = RunResult & {
   normalizedOutput: string;
 };
 
+type PtyProbePayload = {
+  matched: boolean;
+  output: string;
+};
+
 type ToolRegistrySnapshot = {
   toolCount: number;
   toolNames: string[];
@@ -57,27 +63,135 @@ type CommandRegistrySnapshot = {
   promptCount: number;
 };
 
+type ImportEdge = {
+  specifier: string;
+  typeOnly: boolean;
+};
+
+type HotPathStubAudit = {
+  runtimeStubPaths: string[];
+  dormantStubPaths: Array<{ path: string; reason: string }>;
+  typeOnlyStubPaths: string[];
+  visitedRuntimeFiles: string[];
+};
+
+type QueryDynamicRequireTarget = {
+  owners: string[];
+  path: string;
+  gate?: keyof typeof FEATURE_FLAG_STATES;
+};
+
+type AccountingExpectation = {
+  inputTokens: number;
+  outputTokens: number;
+  requirePositiveCost?: boolean;
+};
+
+type ConsistentAccountingOptions = {
+  // Some successful paths surface only the top-level session usage here, while
+  // modelUsage also includes auxiliary models, local agents, or compaction work.
+  allowUsageSubsetOfModelUsage?: boolean;
+  allowZeroInputTokens?: boolean;
+};
+
 const DIVIDER = "─".repeat(72);
 const DEFAULT_MODEL = process.env.SMOKE_MODEL || "claude-sonnet-4-6";
 const DEFAULT_MAX_BUDGET_USD = Number(process.env.SMOKE_MAX_BUDGET_USD || "0.20");
 const DEFAULT_COMMAND_TIMEOUT_MS = Number(process.env.SMOKE_COMMAND_TIMEOUT_MS || "120000");
+const MULTI_STEP_TOOL_TIMEOUT_MS = Number(process.env.SMOKE_MULTI_STEP_TOOL_TIMEOUT_MS || "180000");
 const KNOWN_UNREGISTERED_TOOL_DIRS = new Set([
   "DiscoverSkillsTool",
   "MCPTool",
   "McpAuthTool",
   "ReviewArtifactTool",
 ]);
-const OFFLINE_CHECKS = [
+const KNOWN_DORMANT_STUB_REASONS: Record<string, () => string | null> = {
+  "src/commands/reset-limits/index.ts": () =>
+    process.env.USER_TYPE === "ant" ? null : "gated by USER_TYPE === 'ant'",
+  "src/tools/TungstenTool/TungstenTool.ts": () =>
+    process.env.USER_TYPE === "ant" ? null : "gated by USER_TYPE === 'ant'",
+  "src/tools/WorkflowTool/constants.ts": () =>
+    feature("WORKFLOW_SCRIPTS") ? null : "gated by feature('WORKFLOW_SCRIPTS')",
+  "src/types/connectorText.ts": () =>
+    feature("CONNECTOR_TEXT") ? null : "gated by feature('CONNECTOR_TEXT')",
+};
+const FEATURE_FLAG_STATES = {
+  REACTIVE_COMPACT: feature("REACTIVE_COMPACT") ? true : false,
+  CONTEXT_COLLAPSE: feature("CONTEXT_COLLAPSE") ? true : false,
+  EXPERIMENTAL_SKILL_SEARCH: feature("EXPERIMENTAL_SKILL_SEARCH") ? true : false,
+  TEMPLATES: feature("TEMPLATES") ? true : false,
+  HISTORY_SNIP: feature("HISTORY_SNIP") ? true : false,
+  BG_SESSIONS: feature("BG_SESSIONS") ? true : false,
+  COORDINATOR_MODE: feature("COORDINATOR_MODE") ? true : false,
+} as const;
+const QUERY_DYNAMIC_REQUIRE_TARGETS: QueryDynamicRequireTarget[] = [
+  {
+    owners: ["src/query.ts"],
+    path: "src/services/compact/reactiveCompact.ts",
+    gate: "REACTIVE_COMPACT",
+  },
+  {
+    owners: ["src/query.ts"],
+    path: "src/services/contextCollapse/index.ts",
+    gate: "CONTEXT_COLLAPSE",
+  },
+  {
+    owners: ["src/query.ts"],
+    path: "src/services/skillSearch/prefetch.ts",
+    gate: "EXPERIMENTAL_SKILL_SEARCH",
+  },
+  {
+    owners: ["src/query.ts"],
+    path: "src/jobs/classifier.ts",
+    gate: "TEMPLATES",
+  },
+  {
+    owners: ["src/query.ts", "src/QueryEngine.ts"],
+    path: "src/services/compact/snipCompact.ts",
+    gate: "HISTORY_SNIP",
+  },
+  {
+    owners: ["src/query.ts"],
+    path: "src/utils/taskSummary.ts",
+    gate: "BG_SESSIONS",
+  },
+  {
+    owners: ["src/QueryEngine.ts"],
+    path: "src/components/MessageSelector.tsx",
+  },
+  {
+    owners: ["src/QueryEngine.ts"],
+    path: "src/coordinator/coordinatorMode.ts",
+    gate: "COORDINATOR_MODE",
+  },
+  {
+    owners: ["src/QueryEngine.ts"],
+    path: "src/services/compact/snipProjection.ts",
+    gate: "HISTORY_SNIP",
+  },
+];
+export const OFFLINE_CHECKS = [
   "dist",
   "version",
   "help",
   "tool-registry",
   "command-registry",
   "hot-path-stubs",
+  "query-dynamic-requires",
   "doctor",
+  "memory-command",
+  "context-command",
 ] as const;
-const ONLINE_CHECKS = [
+export const ONLINE_CHECKS = [
   "api-basic",
+  "api-retry",
+  "query-loop",
+  "streaming-fallback",
+  "permission-denial",
+  "error-max-turns",
+  "error-during-execution",
+  "error-max-structured-output-retries",
+  "error-max-budget",
   "claude-md-context",
   "bash-tool",
   "read-tool",
@@ -95,19 +209,67 @@ const ONLINE_CHECKS = [
   "compact-flow",
   "resume-flow",
 ] as const;
-const OPTIONAL_LOCAL_CHECKS = ["chrome-readiness", "chrome-smoke"] as const;
+export const ONLINE_CHECK_GROUPS = {
+  "api-and-session": [
+    "api-basic",
+    "query-loop",
+    "api-retry",
+    "streaming-fallback",
+    "permission-denial",
+    "error-max-turns",
+    "error-during-execution",
+    "error-max-structured-output-retries",
+    "error-max-budget",
+    "claude-md-context",
+    "resume-flow",
+    "compact-flow",
+  ],
+  "tools-and-agent": [
+    "bash-tool",
+    "read-tool",
+    "write-tool",
+    "edit-tool",
+    "notebook-edit-tool",
+    "grep-tool",
+    "glob-tool",
+    "agent-flow",
+  ],
+  integrations: [
+    "webfetch-tool",
+    "websearch-tool",
+    "mcp-flow",
+    "mcp-http-auth-flow",
+    "mcp-http-headers-helper-flow",
+  ],
+} as const;
+export const OPTIONAL_LOCAL_CHECKS = ["chrome-readiness", "chrome-smoke"] as const;
 const ALL_CHECKS = [...OFFLINE_CHECKS, ...ONLINE_CHECKS, ...OPTIONAL_LOCAL_CHECKS];
 
 type CheckName = (typeof ALL_CHECKS)[number];
+type OnlineCheckGroupName = keyof typeof ONLINE_CHECK_GROUPS;
+export const ONLINE_CHECK_GROUP_NAMES = Object.keys(ONLINE_CHECK_GROUPS) as OnlineCheckGroupName[];
 
 const args = parseArgs(Bun.argv.slice(2));
-const selectedChecks = resolveChecks(args.checks, args.online);
+if (args.listGroups) {
+  printAvailableCheckGroups();
+  process.exit(0);
+}
+const selectedChecks = resolveChecks(args.checks, args.groups, args.online);
 const results: CheckResult[] = [];
 
-function parseArgs(argv: string[]) {
+export function parseCommaSeparatedArg(value: string | undefined): string[] {
+  return (value || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+export function parseArgs(argv: string[]) {
   const parsed = {
     online: false,
     checks: [] as string[],
+    groups: [] as string[],
+    listGroups: false,
     model: DEFAULT_MODEL,
     maxBudgetUsd: DEFAULT_MAX_BUDGET_USD,
   };
@@ -120,20 +282,40 @@ function parseArgs(argv: string[]) {
     }
 
     if (arg === "--checks") {
-      parsed.checks = (argv[index + 1] || "")
-        .split(",")
-        .map((item) => item.trim())
-        .filter(Boolean);
+      parsed.checks = parseCommaSeparatedArg(argv[index + 1]);
       index += 1;
       continue;
     }
 
     if (arg.startsWith("--checks=")) {
-      parsed.checks = arg
-        .slice("--checks=".length)
-        .split(",")
-        .map((item) => item.trim())
-        .filter(Boolean);
+      parsed.checks = parseCommaSeparatedArg(arg.slice("--checks=".length));
+      continue;
+    }
+
+    if (arg === "--group") {
+      parsed.groups = [...parsed.groups, ...parseCommaSeparatedArg(argv[index + 1])];
+      index += 1;
+      continue;
+    }
+
+    if (arg.startsWith("--group=")) {
+      parsed.groups = [...parsed.groups, ...parseCommaSeparatedArg(arg.slice("--group=".length))];
+      continue;
+    }
+
+    if (arg === "--groups") {
+      parsed.groups = [...parsed.groups, ...parseCommaSeparatedArg(argv[index + 1])];
+      index += 1;
+      continue;
+    }
+
+    if (arg.startsWith("--groups=")) {
+      parsed.groups = [...parsed.groups, ...parseCommaSeparatedArg(arg.slice("--groups=".length))];
+      continue;
+    }
+
+    if (arg === "--list-groups") {
+      parsed.listGroups = true;
       continue;
     }
 
@@ -162,13 +344,45 @@ function parseArgs(argv: string[]) {
   return parsed;
 }
 
-function resolveChecks(requestedChecks: string[], includeOnline: boolean): CheckName[] {
-  if (requestedChecks.length > 0) {
-    const invalid = requestedChecks.filter((check) => !ALL_CHECKS.includes(check as CheckName));
-    if (invalid.length > 0) {
-      throw new Error(`Unknown smoke check(s): ${invalid.join(", ")}`);
+export function dedupeChecks(checks: CheckName[]): CheckName[] {
+  return [...new Set(checks)];
+}
+
+export function printAvailableCheckGroups() {
+  console.log("Available online smoke groups:");
+  for (const groupName of ONLINE_CHECK_GROUP_NAMES) {
+    console.log(`  - ${groupName}: ${ONLINE_CHECK_GROUPS[groupName].join(", ")}`);
+  }
+  console.log("");
+  console.log("Use --groups <group[,group...]> or repeat --group <group>.");
+}
+
+export function resolveChecks(requestedChecks: string[], requestedGroups: string[], includeOnline: boolean): CheckName[] {
+  const resolvedChecks: CheckName[] = [];
+
+  if (requestedGroups.length > 0) {
+    const invalidGroups = requestedGroups.filter(
+      (groupName) => !ONLINE_CHECK_GROUP_NAMES.includes(groupName as OnlineCheckGroupName),
+    );
+    if (invalidGroups.length > 0) {
+      throw new Error(`Unknown smoke group(s): ${invalidGroups.join(", ")}`);
     }
-    return requestedChecks as CheckName[];
+
+    for (const groupName of requestedGroups as OnlineCheckGroupName[]) {
+      resolvedChecks.push(...ONLINE_CHECK_GROUPS[groupName]);
+    }
+  }
+
+  if (requestedChecks.length > 0) {
+    const invalidChecks = requestedChecks.filter((check) => !ALL_CHECKS.includes(check as CheckName));
+    if (invalidChecks.length > 0) {
+      throw new Error(`Unknown smoke check(s): ${invalidChecks.join(", ")}`);
+    }
+    resolvedChecks.push(...(requestedChecks as CheckName[]));
+  }
+
+  if (resolvedChecks.length > 0) {
+    return dedupeChecks(resolvedChecks);
   }
 
   return includeOnline
@@ -330,8 +544,123 @@ async function runTerminalProbe(
         timedOut,
         normalizedOutput: normalizeTerminalOutput(`${stdout}\n${stderr}`),
       });
-    });
+      });
   });
+}
+
+async function runInteractivePtyProbe(
+  command: string[],
+  {
+    cwd,
+    env,
+    input,
+    inputDelayMs = 0,
+    maxWaitMs,
+    readyMarkers = [],
+    successMarkers,
+  }: {
+    cwd?: string;
+    env?: Record<string, string>;
+    input: string;
+    inputDelayMs?: number;
+    maxWaitMs: number;
+    readyMarkers?: string[];
+    successMarkers: string[];
+  },
+): Promise<TerminalProbeResult> {
+  const pythonScript = [
+    "import base64",
+    "import json",
+    "import os",
+    "import pty",
+    "import select",
+    "import subprocess",
+    "import sys",
+    "import time",
+    "",
+    "command = json.loads(sys.argv[1])",
+    "cwd = sys.argv[2]",
+    "env_patch = json.loads(sys.argv[3])",
+    "input_bytes = base64.b64decode(sys.argv[4])",
+    "input_delay_ms = int(sys.argv[5])",
+    "max_wait_ms = int(sys.argv[6])",
+    "success_markers = json.loads(sys.argv[7])",
+    "ready_markers = json.loads(sys.argv[8])",
+    "env = os.environ.copy()",
+    "env.update(env_patch)",
+    "master, slave = pty.openpty()",
+    "proc = subprocess.Popen(command, stdin=slave, stdout=slave, stderr=slave, cwd=cwd, env=env, close_fds=True)",
+    "os.close(slave)",
+    "output = bytearray()",
+    "started_at = time.time()",
+    "input_sent = not input_bytes",
+    "matched = False",
+    "deadline = time.time() + (max_wait_ms / 1000.0)",
+    "while time.time() < deadline:",
+    "    timeout = max(0.0, min(0.2, deadline - time.time()))",
+    "    ready, _, _ = select.select([master], [], [], timeout)",
+    "    if master in ready:",
+    "        try:",
+    "            chunk = os.read(master, 65536)",
+    "        except OSError:",
+    "            break",
+    "        if not chunk:",
+    "            break",
+    "        output.extend(chunk)",
+    "    if not input_sent:",
+    "        delay_elapsed = (time.time() - started_at) * 1000.0 >= input_delay_ms",
+    "        ready_matched = not ready_markers or all(marker.encode('utf-8') in output for marker in ready_markers)",
+    "        if delay_elapsed and ready_matched:",
+    "            os.write(master, input_bytes)",
+    "            input_sent = True",
+    "            continue",
+    "    if not input_sent:",
+    "        continue",
+    "    if success_markers and all(marker.encode('utf-8') in output for marker in success_markers):",
+    "        matched = True",
+    "        break",
+    "try:",
+    "    proc.terminate()",
+    "except Exception:",
+    "    pass",
+    "time.sleep(0.2)",
+    "if proc.poll() is None:",
+    "    try:",
+    "        proc.kill()",
+    "    except Exception:",
+    "        pass",
+    "print(json.dumps({'output': output.decode('utf-8', 'ignore'), 'matched': matched}))",
+  ].join("\n");
+
+  const result = await runCommand(
+    [
+      "python3",
+      "-c",
+      pythonScript,
+      JSON.stringify(command),
+      cwd ?? process.cwd(),
+      JSON.stringify(env ?? {}),
+      Buffer.from(input, "utf8").toString("base64"),
+      String(inputDelayMs),
+      String(maxWaitMs),
+      JSON.stringify(successMarkers),
+      JSON.stringify(readyMarkers),
+    ],
+    {
+      timeoutMs: maxWaitMs + 3_000,
+    },
+  );
+
+  const payload = parseJsonOutput<PtyProbePayload>(result, "interactive-pty");
+  return {
+    exitCode: result.exitCode,
+    stdout: payload.output,
+    stderr: result.stderr,
+    timedOut: !payload.matched,
+    anchorOutput: normalizeTerminalAnchorOutput(payload.output),
+    matched: payload.matched,
+    normalizedOutput: normalizeTerminalOutput(payload.output),
+  };
 }
 
 function parseJsonLines(stdout: string): Array<Record<string, unknown>> {
@@ -345,6 +674,169 @@ function parseJsonLines(stdout: string): Array<Record<string, unknown>> {
 function lastJsonObject(stdout: string): Record<string, unknown> | null {
   const objects = parseJsonLines(stdout);
   return objects.at(-1) ?? null;
+}
+
+function assertPayloadAccounting(
+  payload: Record<string, unknown>,
+  label: string,
+  expectation: AccountingExpectation,
+): string | null {
+  const usage =
+    payload.usage && typeof payload.usage === "object"
+      ? (payload.usage as { input_tokens?: unknown; output_tokens?: unknown })
+      : null;
+  if (
+    !usage ||
+    Number(usage.input_tokens ?? NaN) !== expectation.inputTokens ||
+    Number(usage.output_tokens ?? NaN) !== expectation.outputTokens
+  ) {
+    return label + ": returned unexpected usage totals";
+  }
+
+  const totalCostUsd =
+    typeof payload.total_cost_usd === "number"
+      ? payload.total_cost_usd
+      : Number(payload.total_cost_usd);
+  const requirePositiveCost = expectation.requirePositiveCost ?? true;
+  if (
+    !Number.isFinite(totalCostUsd) ||
+    (requirePositiveCost ? totalCostUsd <= 0 : totalCostUsd < 0)
+  ) {
+    return label + ": returned unexpected total_cost_usd";
+  }
+
+  const modelUsage =
+    payload.modelUsage && typeof payload.modelUsage === "object"
+      ? (payload.modelUsage as Record<
+          string,
+          { inputTokens?: unknown; outputTokens?: unknown; costUSD?: unknown }
+        >)
+      : {};
+  const aggregateModelUsage = Object.values(modelUsage).reduce(
+    (acc, entry) => ({
+      inputTokens: acc.inputTokens + Number(entry.inputTokens ?? 0),
+      outputTokens: acc.outputTokens + Number(entry.outputTokens ?? 0),
+      costUSD: acc.costUSD + Number(entry.costUSD ?? 0),
+    }),
+    { inputTokens: 0, outputTokens: 0, costUSD: 0 },
+  );
+  if (
+    aggregateModelUsage.inputTokens !== expectation.inputTokens ||
+    aggregateModelUsage.outputTokens !== expectation.outputTokens ||
+    (requirePositiveCost
+      ? aggregateModelUsage.costUSD <= 0
+      : aggregateModelUsage.costUSD < 0)
+  ) {
+    return label + ": returned unexpected modelUsage totals";
+  }
+
+  return null;
+}
+
+function assertPayloadHasConsistentAccounting(
+  payload: Record<string, unknown>,
+  label: string,
+  options: ConsistentAccountingOptions = {},
+): string | null {
+  const usage =
+    payload.usage && typeof payload.usage === "object"
+      ? (payload.usage as {
+          input_tokens?: unknown;
+          output_tokens?: unknown;
+          cache_read_input_tokens?: unknown;
+          cache_creation_input_tokens?: unknown;
+        })
+      : null;
+  if (!usage) {
+    return label + ": missing usage payload";
+  }
+
+  const inputTokens = Number(usage.input_tokens ?? NaN);
+  const outputTokens = Number(usage.output_tokens ?? NaN);
+  const cacheReadTokens = Number(usage.cache_read_input_tokens ?? 0);
+  const cacheCreationTokens = Number(usage.cache_creation_input_tokens ?? 0);
+  const allowZeroInputTokens = options.allowZeroInputTokens ?? false;
+  if (!Number.isFinite(inputTokens) || (allowZeroInputTokens ? inputTokens < 0 : inputTokens <= 0)) {
+    return label + ": returned unexpected input token usage";
+  }
+  if (!Number.isFinite(outputTokens) || outputTokens < 0) {
+    return label + ": returned unexpected output token usage";
+  }
+  if (!Number.isFinite(cacheReadTokens) || cacheReadTokens < 0) {
+    return label + ": returned unexpected cache_read_input_tokens";
+  }
+  if (!Number.isFinite(cacheCreationTokens) || cacheCreationTokens < 0) {
+    return label + ": returned unexpected cache_creation_input_tokens";
+  }
+
+  const totalCostUsd =
+    typeof payload.total_cost_usd === "number"
+      ? payload.total_cost_usd
+      : Number(payload.total_cost_usd);
+  if (!Number.isFinite(totalCostUsd) || totalCostUsd <= 0) {
+    return label + ": returned unexpected total_cost_usd";
+  }
+
+  const modelUsage =
+    payload.modelUsage && typeof payload.modelUsage === "object"
+      ? (payload.modelUsage as Record<
+          string,
+          {
+            inputTokens?: unknown;
+            outputTokens?: unknown;
+            cacheReadInputTokens?: unknown;
+            cacheCreationInputTokens?: unknown;
+            costUSD?: unknown;
+          }
+        >)
+      : {};
+  if (Object.keys(modelUsage).length === 0) {
+    return label + ": missing modelUsage payload";
+  }
+
+  const aggregateModelUsage = Object.values(modelUsage).reduce(
+    (acc, entry) => ({
+      inputTokens: acc.inputTokens + Number(entry.inputTokens ?? 0),
+      outputTokens: acc.outputTokens + Number(entry.outputTokens ?? 0),
+      cacheReadInputTokens:
+        acc.cacheReadInputTokens + Number(entry.cacheReadInputTokens ?? 0),
+      cacheCreationInputTokens:
+        acc.cacheCreationInputTokens +
+        Number(entry.cacheCreationInputTokens ?? 0),
+      costUSD: acc.costUSD + Number(entry.costUSD ?? 0),
+    }),
+    {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadInputTokens: 0,
+      cacheCreationInputTokens: 0,
+      costUSD: 0,
+    },
+  );
+
+  if (options.allowUsageSubsetOfModelUsage) {
+    if (
+      aggregateModelUsage.inputTokens < inputTokens ||
+      aggregateModelUsage.outputTokens < outputTokens ||
+      aggregateModelUsage.cacheReadInputTokens < cacheReadTokens ||
+      aggregateModelUsage.cacheCreationInputTokens < cacheCreationTokens
+    ) {
+      return label + ": aggregate modelUsage fell below top-level usage";
+    }
+  } else if (
+    aggregateModelUsage.inputTokens !== inputTokens ||
+    aggregateModelUsage.outputTokens !== outputTokens ||
+    aggregateModelUsage.cacheReadInputTokens !== cacheReadTokens ||
+    aggregateModelUsage.cacheCreationInputTokens !== cacheCreationTokens
+  ) {
+    return label + ": usage and modelUsage totals diverged";
+  }
+
+  if (Math.abs(aggregateModelUsage.costUSD - totalCostUsd) > 1e-9) {
+    return label + ": total_cost_usd and modelUsage cost diverged";
+  }
+
+  return null;
 }
 
 function parseJsonOutput<T>(result: RunResult, label: string): T {
@@ -361,6 +853,12 @@ function parseJsonOutput<T>(result: RunResult, label: string): T {
       `${label} probe returned invalid JSON: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
+}
+
+function encodeAnthropicSse(events: Array<[string, unknown]>): string {
+  return events
+    .map(([event, data]) => "event: " + event + "\ndata: " + JSON.stringify(data) + "\n\n")
+    .join("");
 }
 
 async function inspectToolRegistry(): Promise<ToolRegistrySnapshot> {
@@ -515,6 +1013,200 @@ function toolStructuredResult(events: Array<Record<string, unknown>>, toolName: 
 
   const structured = matchingUserEvent.tool_use_result;
   return structured && typeof structured === "object" ? (structured as Record<string, unknown>) : null;
+}
+
+export function shouldRetryTransientToolSmoke(detail: string): boolean {
+  return detail.includes("[smoke-timeout]") || detail.includes("tool_use event not observed");
+}
+
+function hasStubMarker(source: string): boolean {
+  return source.includes("Auto-generated stub") || source.includes("replace with real implementation");
+}
+
+function summarizePaths(paths: string[], sampleSize = 3, preferred: string[] = []): string {
+  if (paths.length === 0) {
+    return "0";
+  }
+  const prioritized = [
+    ...preferred.filter((path) => paths.includes(path)),
+    ...paths.filter((path) => !preferred.includes(path)),
+  ];
+  const sample = prioritized.slice(0, sampleSize);
+  const remainder = paths.length - sample.length;
+  return remainder > 0
+    ? `${paths.length} (${sample.join(", ")} + ${remainder} more)`
+    : `${paths.length} (${sample.join(", ")})`;
+}
+
+function summarizeDormantStubPaths(
+  paths: Array<{ path: string; reason: string }>,
+  sampleSize = 2,
+): string {
+  if (paths.length === 0) {
+    return "0";
+  }
+  const sample = paths.slice(0, sampleSize).map(({ path, reason }) => `${path} (${reason})`);
+  const remainder = paths.length - sample.length;
+  return remainder > 0
+    ? `${paths.length} (${sample.join(", ")} + ${remainder} more)`
+    : `${paths.length} (${sample.join(", ")})`;
+}
+
+function summarizeDynamicTargets(
+  targets: Array<{ path: string; gate?: keyof typeof FEATURE_FLAG_STATES }>,
+  sampleSize = 2,
+  preferred: string[] = [],
+): string {
+  if (targets.length === 0) {
+    return "0";
+  }
+  const labels = targets.map(({ path, gate }) => ({
+    path,
+    label: gate ? `${path} [${gate}=off]` : `${path} [active]`,
+  }));
+  const prioritized = [
+    ...preferred.map((path) => labels.find((entry) => entry.path === path)).filter(Boolean),
+    ...labels.filter((entry) => !preferred.includes(entry.path)),
+  ] as Array<{ path: string; label: string }>;
+  const sample = prioritized.slice(0, sampleSize).map((entry) => entry.label);
+  const remainder = labels.length - sample.length;
+  return remainder > 0
+    ? `${labels.length} (${sample.join(", ")} + ${remainder} more)`
+    : `${labels.length} (${sample.join(", ")})`;
+}
+
+function extractRelativeImports(source: string): ImportEdge[] {
+  const imports: ImportEdge[] = [];
+  const seen = new Set<string>();
+  const pushImport = (specifier: string, typeOnly: boolean) => {
+    if (!specifier.startsWith(".")) {
+      return;
+    }
+    const key = `${typeOnly ? "type" : "value"}:${specifier}`;
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    imports.push({ specifier, typeOnly });
+  };
+
+  for (const match of source.matchAll(/(^|\n)\s*import\s+(type\s+)?[\s\S]*?from\s+["']([^"']+)["']/g)) {
+    pushImport(match[3]!, Boolean(match[2]));
+  }
+
+  for (const match of source.matchAll(/(^|\n)\s*import\s+["']([^"']+)["']/g)) {
+    pushImport(match[2]!, false);
+  }
+
+  return imports;
+}
+
+async function resolveRuntimeImport(importer: string, specifier: string): Promise<string | null> {
+  const importerDir = dirname(importer);
+  const basePath = resolve(importerDir, specifier);
+  const candidates = [
+    basePath,
+    `${basePath}.ts`,
+    `${basePath}.tsx`,
+    `${basePath}/index.ts`,
+    `${basePath}/index.tsx`,
+  ];
+
+  if (specifier.endsWith(".js")) {
+    const withoutJs = basePath.slice(0, -3);
+    candidates.unshift(
+      `${withoutJs}.ts`,
+      `${withoutJs}.tsx`,
+      `${withoutJs}/index.ts`,
+      `${withoutJs}/index.tsx`,
+    );
+  }
+
+  for (const candidate of candidates) {
+    try {
+      const candidateStat = await stat(candidate);
+      if (candidateStat.isFile()) {
+        return candidate;
+      }
+    } catch {
+      // Try the next candidate.
+    }
+  }
+
+  return null;
+}
+
+async function auditHotPathStubImports(roots: string[]): Promise<HotPathStubAudit> {
+  const runtimeStubPaths = new Set<string>();
+  const dormantStubPaths = new Map<string, string>();
+  const typeOnlyStubPaths = new Set<string>();
+  const visitedRuntimeFiles = new Set<string>();
+  const classifyStubPath = (file: string) => {
+    const relativePath = relative(process.cwd(), file) || file;
+    const dormantReason = KNOWN_DORMANT_STUB_REASONS[relativePath]?.();
+    if (dormantReason) {
+      dormantStubPaths.set(relativePath, dormantReason);
+      return { relativePath, dormant: true };
+    }
+    return { relativePath, dormant: false };
+  };
+
+  const walkRuntime = async (file: string): Promise<void> => {
+    if (visitedRuntimeFiles.has(file)) {
+      return;
+    }
+    visitedRuntimeFiles.add(file);
+
+    const source = await Bun.file(file).text();
+    if (hasStubMarker(source)) {
+      const stubPath = classifyStubPath(file);
+      if (!stubPath.dormant) {
+        runtimeStubPaths.add(stubPath.relativePath);
+      }
+      return;
+    }
+
+    const imports = extractRelativeImports(source);
+    for (const imported of imports) {
+      const resolved = await resolveRuntimeImport(file, imported.specifier);
+      if (!resolved) {
+        continue;
+      }
+
+      const importedSource = await Bun.file(resolved).text();
+      if (imported.typeOnly) {
+        if (hasStubMarker(importedSource)) {
+          typeOnlyStubPaths.add(relative(process.cwd(), resolved) || resolved);
+        }
+        continue;
+      }
+
+      if (hasStubMarker(importedSource)) {
+        const stubPath = classifyStubPath(resolved);
+        if (!stubPath.dormant) {
+          runtimeStubPaths.add(stubPath.relativePath);
+        }
+        continue;
+      }
+
+      await walkRuntime(resolved);
+    }
+  };
+
+  for (const root of roots) {
+    await walkRuntime(resolve(process.cwd(), root));
+  }
+
+  return {
+    runtimeStubPaths: Array.from(runtimeStubPaths).sort(),
+    dormantStubPaths: Array.from(dormantStubPaths.entries())
+      .map(([path, reason]) => ({ path, reason }))
+      .sort((a, b) => a.path.localeCompare(b.path)),
+    typeOnlyStubPaths: Array.from(typeOnlyStubPaths).sort(),
+    visitedRuntimeFiles: Array.from(visitedRuntimeFiles)
+      .map((file) => relative(process.cwd(), file) || file)
+      .sort(),
+  };
 }
 
 function budgetLimited(result: RunResult): boolean {
@@ -717,6 +1409,95 @@ async function checkDoctor() {
   };
 }
 
+async function checkMemoryCommand() {
+  try {
+    const result = await runInteractivePtyProbe(["node", "dist/cli.js"], {
+      cwd: process.cwd(),
+      input: "/memory\r",
+      readyMarkers: ["Claude Code", "bypass permissions on"],
+      maxWaitMs: 12_000,
+      successMarkers: [
+        "Memory",
+        "Project memory",
+        "User memory",
+        "Checked in at ./CLAUDE.md",
+        "Saved in ~/.claude/CLAUDE.md",
+      ],
+    });
+
+    if (!result.matched) {
+      return {
+        status: "error" as const,
+        detail:
+          "memory screen did not render expected anchors: " +
+          compactOutput(result.normalizedOutput),
+      };
+    }
+
+    return {
+      status: "ok" as const,
+      detail: "/memory rendered Memory/Project memory/User memory anchors in a PTY session",
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes("python3") && message.includes("ENOENT")) {
+      return {
+        status: "skip" as const,
+        detail: "python3 is unavailable, so the /memory PTY smoke was skipped",
+      };
+    }
+    return {
+      status: "error" as const,
+      detail: compactOutput(message),
+    };
+  }
+}
+
+async function checkContextCommand() {
+  const result = await runCommand([
+    "node",
+    "dist/cli.js",
+    "-p",
+    "/context",
+    "--output-format",
+    "json",
+    "--permission-mode",
+    "bypassPermissions",
+    "--max-turns",
+    "1",
+  ]);
+
+  if (result.exitCode !== 0) {
+    return {
+      status: "error" as const,
+      detail: compactOutput(result.stderr || result.stdout),
+    };
+  }
+
+  const payload = extractSuccessfulJsonResult(result);
+  const finalResult = payload?.result ? String(payload.result) : "";
+  const claudeMdPath = join(process.cwd(), "CLAUDE.md");
+
+  if (!finalResult.includes("## Context Usage") || !finalResult.includes("**Tokens:**")) {
+    return {
+      status: "error" as const,
+      detail: "noninteractive /context output did not include the expected summary headings",
+    };
+  }
+
+  if (!finalResult.includes("### Memory Files") || !finalResult.includes(claudeMdPath)) {
+    return {
+      status: "error" as const,
+      detail: "noninteractive /context output did not include the expected memory file listing",
+    };
+  }
+
+  return {
+    status: "ok" as const,
+    detail: "noninteractive /context rendered context summary and listed project CLAUDE.md",
+  };
+}
+
 async function checkChromeReadiness() {
   const summary = await collectClaudeInChromeReadinessSummary();
 
@@ -780,22 +1561,100 @@ async function checkHotPathStubs() {
     "src/commands.ts",
     "src/services/mcp/client.ts",
   ];
-  const offenders: string[] = [];
+  const directOffenders: string[] = [];
   for (const file of files) {
     const source = await Bun.file(file).text();
-    if (source.includes("Auto-generated stub") || source.includes("replace with real implementation")) {
-      offenders.push(file);
+    if (hasStubMarker(source)) {
+      directOffenders.push(file);
     }
   }
 
-  if (offenders.length > 0) {
+  if (directOffenders.length > 0) {
     return {
       status: "error" as const,
-      detail: `stub marker found in hot path: ${offenders.join(", ")}`,
+      detail: `stub marker found in hot path entry file(s): ${directOffenders.join(", ")}`,
     };
   }
 
-  return { status: "ok" as const, detail: `${files.length} hot-path files are stub-free` };
+  const audit = await auditHotPathStubImports(files);
+  if (audit.runtimeStubPaths.length > 0) {
+    return {
+      status: "error" as const,
+      detail: `runtime import graph reaches stub file(s): ${audit.runtimeStubPaths.join(", ")}`,
+    };
+  }
+
+  const typeOnlyNote =
+    audit.typeOnlyStubPaths.length > 0
+      ? `; type-only stub(s): ${summarizePaths(audit.typeOnlyStubPaths, 3, ["src/query/transitions.ts"])}`
+      : "";
+  const dormantNote =
+    audit.dormantStubPaths.length > 0
+      ? `; dormant stub(s): ${summarizeDormantStubPaths(audit.dormantStubPaths)}`
+      : "";
+
+  return {
+    status: "ok" as const,
+    detail: `${files.length} hot-path roots reached ${audit.visitedRuntimeFiles.length} runtime files with no runtime stubs${typeOnlyNote}${dormantNote}`,
+  };
+}
+
+async function checkQueryDynamicRequires() {
+  const activeReal: Array<{ path: string; gate?: keyof typeof FEATURE_FLAG_STATES }> = [];
+  const gatedReal: Array<{ path: string; gate?: keyof typeof FEATURE_FLAG_STATES }> = [];
+  const dormantStub: Array<{ path: string; gate?: keyof typeof FEATURE_FLAG_STATES }> = [];
+  const errors: string[] = [];
+
+  for (const target of QUERY_DYNAMIC_REQUIRE_TARGETS) {
+    const resolvedPath = resolve(process.cwd(), target.path);
+    let exists = false;
+    try {
+      const fileStat = await stat(resolvedPath);
+      exists = fileStat.isFile();
+    } catch {
+      exists = false;
+    }
+
+    const gateEnabled = target.gate ? FEATURE_FLAG_STATES[target.gate] : true;
+    const ownerLabel = target.owners.join(", ");
+
+    if (!exists) {
+      if (gateEnabled) {
+        errors.push(`${target.path} missing for active require from ${ownerLabel}`);
+      }
+      continue;
+    }
+
+    const source = await Bun.file(resolvedPath).text();
+    const stub = hasStubMarker(source);
+
+    if (gateEnabled) {
+      if (stub) {
+        errors.push(`${target.path} is stubbed while active for ${ownerLabel}`);
+      } else {
+        activeReal.push(target);
+      }
+      continue;
+    }
+
+    if (stub) {
+      dormantStub.push(target);
+    } else {
+      gatedReal.push(target);
+    }
+  }
+
+  if (errors.length > 0) {
+    return {
+      status: "error" as const,
+      detail: errors.join("; "),
+    };
+  }
+
+  return {
+    status: "ok" as const,
+    detail: `${QUERY_DYNAMIC_REQUIRE_TARGETS.length} query dynamic require target(s) audited; active real: ${summarizeDynamicTargets(activeReal, 2, ["src/components/MessageSelector.tsx"])}; gated real: ${summarizeDynamicTargets(gatedReal, 2, ["src/coordinator/coordinatorMode.ts"])}; dormant stub: ${summarizeDynamicTargets(dormantStub, 3, ["src/services/compact/reactiveCompact.ts", "src/services/contextCollapse/index.ts", "src/services/compact/snipCompact.ts"])}`,
+  };
 }
 
 async function checkApiBasic() {
@@ -829,7 +1688,1770 @@ async function checkApiBasic() {
     };
   }
 
+  const accountingError = assertPayloadHasConsistentAccounting(
+    payload,
+    "basic API smoke",
+  );
+  if (accountingError) {
+    return {
+      status: "error" as const,
+      detail: accountingError,
+    };
+  }
+
   return { status: "ok" as const, detail: "basic API prompt succeeded" };
+}
+
+async function checkApiRetry() {
+  const tempDir = await mkdtemp(join(tmpdir(), "claude-code-smoke-api-retry-"));
+  const token = "SMOKE_API_RETRY_" + Math.random().toString(36).slice(2, 10);
+  const seenPaths: string[] = [];
+  let requestCount = 0;
+
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch: async (request) => {
+      const url = new URL(request.url);
+      if (request.method !== "POST" || url.pathname !== "/v1/messages") {
+        return new Response("not found", { status: 404 });
+      }
+
+      seenPaths.push(request.method + " " + url.pathname + url.search);
+      requestCount += 1;
+
+      let requestedModel = args.model;
+      try {
+        const body = (await request.json()) as { model?: unknown };
+        if (typeof body?.model === "string" && body.model.length > 0) {
+          requestedModel = body.model;
+        }
+      } catch {
+        // Keep the smoke resilient to parser differences; request count and
+        // final result assertions below still catch protocol drift.
+      }
+
+      if (requestCount === 1) {
+        return new Response(
+          JSON.stringify({
+            type: "error",
+            error: {
+              type: "rate_limit_error",
+              message: "smoke retry please",
+            },
+          }),
+          {
+            status: 429,
+            headers: {
+              "content-type": "application/json",
+              "retry-after": "1",
+            },
+          },
+        );
+      }
+
+      return new Response(
+        encodeAnthropicSse([
+          [
+            "message_start",
+            {
+              type: "message_start",
+              message: {
+                id: "msg_smoke_api_retry",
+                type: "message",
+                role: "assistant",
+                model: requestedModel,
+                content: [],
+                stop_reason: null,
+                stop_sequence: null,
+                usage: {
+                  input_tokens: 12,
+                  output_tokens: 0,
+                },
+              },
+            },
+          ],
+          [
+            "content_block_start",
+            {
+              type: "content_block_start",
+              index: 0,
+              content_block: {
+                type: "text",
+                text: "",
+              },
+            },
+          ],
+          [
+            "content_block_delta",
+            {
+              type: "content_block_delta",
+              index: 0,
+              delta: {
+                type: "text_delta",
+                text: token,
+              },
+            },
+          ],
+          [
+            "content_block_stop",
+            {
+              type: "content_block_stop",
+              index: 0,
+            },
+          ],
+          [
+            "message_delta",
+            {
+              type: "message_delta",
+              delta: {
+                stop_reason: "end_turn",
+                stop_sequence: null,
+              },
+              usage: {
+                output_tokens: token.length,
+              },
+            },
+          ],
+          [
+            "message_stop",
+            {
+              type: "message_stop",
+            },
+          ],
+        ]),
+        {
+          status: 200,
+          headers: {
+            "content-type": "text/event-stream",
+          },
+        },
+      );
+    },
+  });
+
+  const settingsPath = join(tempDir, "settings.json");
+
+  try {
+    await writeFile(
+      settingsPath,
+      JSON.stringify({
+        env: {
+          ANTHROPIC_BASE_URL: "http://127.0.0.1:" + server.port,
+          ANTHROPIC_API_KEY: "smoke-dummy-key",
+        },
+      }),
+      "utf8",
+    );
+
+    const result = await runCommand(
+      [
+        "node",
+        join(process.cwd(), "dist/cli.js"),
+        "-p",
+        "Reply with " + token + " only.",
+        "--model",
+        args.model,
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--max-budget-usd",
+        String(args.maxBudgetUsd),
+        "--permission-mode",
+        "bypassPermissions",
+        "--max-turns",
+        "1",
+        "--settings",
+        settingsPath,
+      ],
+      {
+        cwd: tempDir,
+        env: {
+          ANTHROPIC_BASE_URL: "",
+          ANTHROPIC_API_KEY: "",
+          ANTHROPIC_AUTH_TOKEN: "",
+          CLAUDE_CODE_OAUTH_TOKEN: "",
+        },
+      },
+    );
+
+    if (result.exitCode !== 0) {
+      return {
+        status: "error" as const,
+        detail: compactOutput(result.stderr || result.stdout),
+      };
+    }
+
+    if (requestCount !== 2) {
+      return {
+        status: "error" as const,
+        detail: "api retry smoke expected 2 local /v1/messages requests, saw " + requestCount,
+      };
+    }
+
+    if (seenPaths.some((path) => !path.startsWith("POST /v1/messages"))) {
+      return {
+        status: "error" as const,
+        detail: "api retry smoke hit unexpected local endpoint(s): " + seenPaths.join(", "),
+      };
+    }
+
+    const events = parseJsonLines(result.stdout);
+    const retryEvent = events.find(
+      (event) => event.type === "system" && event.subtype === "api_retry",
+    );
+    if (!retryEvent) {
+      return {
+        status: "error" as const,
+        detail: "api retry smoke did not emit a system api_retry event",
+      };
+    }
+
+    if (
+      retryEvent.attempt !== 1 ||
+      retryEvent.error_status !== 429 ||
+      retryEvent.error !== "rate_limit"
+    ) {
+      return {
+        status: "error" as const,
+        detail: "api retry smoke emitted unexpected api_retry metadata",
+      };
+    }
+
+    if (retryEvent.retry_delay_ms !== 1000) {
+      return {
+        status: "error" as const,
+        detail:
+          "api retry smoke returned unexpected retry_delay_ms: " +
+          String(retryEvent.retry_delay_ms),
+      };
+    }
+
+    const payload = extractSuccessfulJsonResult(result);
+    const finalResult = payload?.result ? String(payload.result).trim() : "";
+    if (!payload || finalResult !== token) {
+      return {
+        status: "error" as const,
+        detail: "api retry smoke did not finish with the expected success result",
+      };
+    }
+
+    if (payload.stop_reason !== "end_turn") {
+      return {
+        status: "error" as const,
+        detail: "api retry smoke returned unexpected stop_reason",
+      };
+    }
+
+    const accountingError = assertPayloadAccounting(payload, "api retry smoke", {
+      inputTokens: 12,
+      outputTokens: token.length,
+    });
+    if (accountingError) {
+      return {
+        status: "error" as const,
+        detail: accountingError,
+      };
+    }
+
+    return {
+      status: "ok" as const,
+      detail:
+        "local 429 + Retry-After surfaced api_retry and then completed successfully with preserved usage/cost metadata",
+    };
+  } finally {
+    server.stop(true);
+    await rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+async function checkQueryLoop() {
+  const expectedResult = "__STREAM_LOOP_OK__";
+  const result = await runCommand([
+    "node",
+    "dist/cli.js",
+    "-p",
+    `Reply with ${expectedResult} only.`,
+    "--model",
+    args.model,
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--max-budget-usd",
+    String(args.maxBudgetUsd),
+    "--permission-mode",
+    "bypassPermissions",
+  ]);
+
+  if (result.exitCode !== 0) {
+    return {
+      status: "error" as const,
+      detail: compactOutput(result.stderr || result.stdout),
+    };
+  }
+
+  const events = parseJsonLines(result.stdout);
+  const initEvent = events.find(
+    (event) => event.type === "system" && event.subtype === "init",
+  );
+  if (!initEvent) {
+    return {
+      status: "error" as const,
+      detail: "stream-json query loop did not emit system init",
+    };
+  }
+
+  const assistantTextSeen = events.some((event) => {
+    if (event.type !== "assistant") {
+      return false;
+    }
+
+    const message = event.message as { content?: Array<{ type?: string; text?: string }> } | undefined;
+    return (message?.content || []).some(
+      (block) => block.type === "text" && typeof block.text === "string" && block.text.includes(expectedResult),
+    );
+  });
+  if (!assistantTextSeen) {
+    return {
+      status: "error" as const,
+      detail: "stream-json query loop did not emit the expected assistant text event",
+    };
+  }
+
+  const payload = lastJsonObject(result.stdout);
+  const finalResult = payload?.result ? String(payload.result).trim() : "";
+  if (!payload || payload.subtype !== "success" || finalResult !== expectedResult) {
+    return {
+      status: "error" as const,
+      detail: "stream-json query loop did not finish with the expected success result",
+    };
+  }
+
+  if (payload.stop_reason !== "end_turn") {
+    return {
+      status: "error" as const,
+      detail: `stream-json query loop returned unexpected stop_reason: ${String(payload.stop_reason ?? "<empty>")}`,
+    };
+  }
+
+  if (payload.session_id !== initEvent.session_id) {
+    return {
+      status: "error" as const,
+      detail: "stream-json query loop changed session_id between init and final result",
+    };
+  }
+
+  const accountingError = assertPayloadHasConsistentAccounting(
+    payload,
+    "stream-json query loop",
+  );
+  if (accountingError) {
+    return {
+      status: "error" as const,
+      detail: accountingError,
+    };
+  }
+
+  const malformedSuccessProbes = [
+    {
+      label: "missing_stop_reason_after_message_stop",
+      expectedResult: "PARTIAL",
+      expectedOutputTokens: 1,
+    },
+    {
+      label: "missing_terminal_events_after_content_block_stop",
+      expectedResult: "COMPLETE_TEXT",
+      expectedOutputTokens: 0,
+    },
+  ] as const;
+
+  async function runMalformedTerminalSuccessProbe(
+    probe: (typeof malformedSuccessProbes)[number],
+  ): Promise<string | null> {
+    const tempDir = await mkdtemp(
+      join(tmpdir(), "claude-code-smoke-query-loop-" + probe.label + "-"),
+    );
+    let requestCount = 0;
+    const seenPaths: string[] = [];
+
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: async (request) => {
+        const url = new URL(request.url);
+        if (request.method === "HEAD" && url.pathname === "/") {
+          return new Response(null, { status: 200 });
+        }
+
+        if (request.method !== "POST" || url.pathname !== "/v1/messages") {
+          return new Response("not found", { status: 404 });
+        }
+
+        requestCount += 1;
+        seenPaths.push(request.method + " " + url.pathname + url.search);
+
+        let requestedModel = args.model;
+        try {
+          const body = (await request.json()) as { model?: unknown };
+          if (typeof body?.model === "string" && body.model.length > 0) {
+            requestedModel = body.model;
+          }
+        } catch {
+          // The final result assertions still catch protocol drift.
+        }
+
+        const baseEvents: Array<[string, unknown]> = [
+          [
+            "message_start",
+            {
+              type: "message_start",
+              message: {
+                id: "msg_smoke_query_loop_" + probe.label,
+                type: "message",
+                role: "assistant",
+                model: requestedModel,
+                content: [],
+                stop_reason: null,
+                stop_sequence: null,
+                usage: {
+                  input_tokens: 7,
+                  output_tokens: 0,
+                },
+              },
+            },
+          ],
+          [
+            "content_block_start",
+            {
+              type: "content_block_start",
+              index: 0,
+              content_block: {
+                type: "text",
+                text: "",
+              },
+            },
+          ],
+          [
+            "content_block_delta",
+            {
+              type: "content_block_delta",
+              index: 0,
+              delta: {
+                type: "text_delta",
+                text: probe.expectedResult,
+              },
+            },
+          ],
+          [
+            "content_block_stop",
+            {
+              type: "content_block_stop",
+              index: 0,
+            },
+          ],
+        ];
+
+        const terminalEvents =
+          probe.label === "missing_stop_reason_after_message_stop"
+            ? ([
+                [
+                  "message_delta",
+                  {
+                    type: "message_delta",
+                    delta: {},
+                    usage: {
+                      output_tokens: 1,
+                    },
+                  },
+                ],
+                [
+                  "message_stop",
+                  {
+                    type: "message_stop",
+                  },
+                ],
+              ] as Array<[string, unknown]>)
+            : [];
+
+        return new Response(encodeAnthropicSse([...baseEvents, ...terminalEvents]), {
+          status: 200,
+          headers: {
+            "content-type": "text/event-stream",
+          },
+        });
+      },
+    });
+
+    const settingsPath = join(tempDir, "settings.json");
+
+    try {
+      await writeFile(
+        settingsPath,
+        JSON.stringify({
+          env: {
+            ANTHROPIC_BASE_URL: "http://127.0.0.1:" + server.port,
+            ANTHROPIC_API_KEY: "smoke-dummy-key",
+          },
+        }),
+        "utf8",
+      );
+
+      const malformedResult = await runCommand(
+        [
+          "node",
+          join(process.cwd(), "dist/cli.js"),
+          "-p",
+          "Reply with PROBE only.",
+          "--model",
+          args.model,
+          "--output-format",
+          "stream-json",
+          "--verbose",
+          "--max-budget-usd",
+          String(args.maxBudgetUsd),
+          "--permission-mode",
+          "bypassPermissions",
+          "--max-turns",
+          "1",
+          "--settings",
+          settingsPath,
+        ],
+        {
+          cwd: tempDir,
+          env: {
+            ANTHROPIC_BASE_URL: "",
+            ANTHROPIC_API_KEY: "",
+            ANTHROPIC_AUTH_TOKEN: "",
+            CLAUDE_CODE_OAUTH_TOKEN: "",
+          },
+        },
+      );
+
+      if (malformedResult.exitCode !== 0) {
+        return probe.label + ": stream-json malformed terminal success probe exited unexpectedly";
+      }
+
+      if (requestCount !== 1) {
+        return (
+          probe.label +
+          ": stream-json malformed terminal success probe expected exactly 1 local /v1/messages request, saw " +
+          requestCount
+        );
+      }
+
+      if (seenPaths.some((path) => !path.startsWith("POST /v1/messages"))) {
+        return (
+          probe.label +
+          ": stream-json malformed terminal success probe hit unexpected local endpoint(s): " +
+          seenPaths.join(", ")
+        );
+      }
+
+      const malformedPayload = lastJsonObject(malformedResult.stdout);
+      const malformedFinalResult = malformedPayload?.result ? String(malformedPayload.result).trim() : "";
+      if (
+        !malformedPayload ||
+        malformedPayload.subtype !== "success" ||
+        malformedFinalResult !== probe.expectedResult
+      ) {
+        return (
+          probe.label +
+          ": stream-json malformed terminal success probe did not finish with the expected success result"
+        );
+      }
+
+      if (malformedPayload.stop_reason !== null) {
+        return probe.label + ": stream-json malformed terminal success probe returned an unexpected stop_reason";
+      }
+
+      const accountingError = assertPayloadAccounting(
+        malformedPayload,
+        probe.label + ": stream-json malformed terminal success probe",
+        {
+          inputTokens: 7,
+          outputTokens: probe.expectedOutputTokens,
+        },
+      );
+      if (accountingError) {
+        return accountingError;
+      }
+
+      return null;
+    } finally {
+      server.stop(true);
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  }
+
+  for (const probe of malformedSuccessProbes) {
+    const failure = await runMalformedTerminalSuccessProbe(probe);
+    if (failure) {
+      return {
+        status: "error" as const,
+        detail: failure,
+      };
+    }
+  }
+
+  return {
+    status: "ok" as const,
+    detail:
+      "stream-json query loop emitted init -> assistant -> success with stop_reason=end_turn, and local malformed terminal streams with assistant text still completed as single-request success while preserving usage/cost when stop_reason or later terminal events were missing",
+  };
+}
+
+async function checkStreamingFallback() {
+  const tempDir = await mkdtemp(join(tmpdir(), "claude-code-smoke-streaming-fallback-"));
+  const expectedRecoveredResult = "RECOVERED";
+  let requestCount = 0;
+  const requests: Array<{
+    path: string;
+    streamField: unknown;
+  }> = [];
+
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch: async (request) => {
+      const url = new URL(request.url);
+      if (request.method === "HEAD" && url.pathname === "/") {
+        return new Response(null, { status: 200 });
+      }
+
+      if (request.method !== "POST" || url.pathname !== "/v1/messages") {
+        return new Response("not found", { status: 404 });
+      }
+
+      requestCount += 1;
+
+      let requestedModel = args.model;
+      let parsedBody: Record<string, unknown> = {};
+      try {
+        parsedBody = (await request.json()) as Record<string, unknown>;
+        if (typeof parsedBody.model === "string" && parsedBody.model.length > 0) {
+          requestedModel = parsedBody.model;
+        }
+      } catch {
+        // The final assertions below still catch protocol drift.
+      }
+
+      requests.push({
+        path: request.method + " " + url.pathname + url.search,
+        streamField: Object.hasOwn(parsedBody, "stream")
+          ? parsedBody.stream
+          : "__missing__",
+      });
+
+      if (requestCount === 1) {
+        return new Response(
+          encodeAnthropicSse([
+            [
+              "message_start",
+              {
+                type: "message_start",
+                message: {
+                  id: "msg_smoke_streaming_fallback_stream_attempt",
+                  type: "message",
+                  role: "assistant",
+                  model: requestedModel,
+                  content: [],
+                  stop_reason: null,
+                  stop_sequence: null,
+                  usage: {
+                    input_tokens: 9,
+                    output_tokens: 0,
+                  },
+                },
+              },
+            ],
+            [
+              "content_block_start",
+              {
+                type: "content_block_start",
+                index: 0,
+                content_block: {
+                  type: "text",
+                  text: "",
+                },
+              },
+            ],
+            [
+              "content_block_delta",
+              {
+                type: "content_block_delta",
+                index: 0,
+                delta: {
+                  type: "text_delta",
+                  text: "BROKEN",
+                },
+              },
+            ],
+          ]),
+          {
+            status: 200,
+            headers: {
+              "content-type": "text/event-stream",
+            },
+          },
+        );
+      }
+
+      return new Response(
+        JSON.stringify({
+          id: "msg_smoke_streaming_fallback_nonstreaming_recovery",
+          type: "message",
+          role: "assistant",
+          model: requestedModel,
+          content: [
+            {
+              type: "text",
+              text: expectedRecoveredResult,
+            },
+          ],
+          stop_reason: "end_turn",
+          stop_sequence: null,
+          usage: {
+            input_tokens: 11,
+            output_tokens: 1,
+          },
+        }),
+        {
+          status: 200,
+          headers: {
+            "content-type": "application/json",
+          },
+        },
+      );
+    },
+  });
+
+  const settingsPath = join(tempDir, "settings.json");
+
+  try {
+    await writeFile(
+      settingsPath,
+      JSON.stringify({
+        env: {
+          ANTHROPIC_BASE_URL: "http://127.0.0.1:" + server.port,
+          ANTHROPIC_API_KEY: "smoke-dummy-key",
+        },
+      }),
+      "utf8",
+    );
+
+    const result = await runCommand(
+      [
+        "node",
+        join(process.cwd(), "dist/cli.js"),
+        "-p",
+        "Reply with PROBE only.",
+        "--model",
+        args.model,
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--max-budget-usd",
+        String(args.maxBudgetUsd),
+        "--permission-mode",
+        "bypassPermissions",
+        "--max-turns",
+        "1",
+        "--settings",
+        settingsPath,
+      ],
+      {
+        cwd: tempDir,
+        env: {
+          ANTHROPIC_BASE_URL: "",
+          ANTHROPIC_API_KEY: "",
+          ANTHROPIC_AUTH_TOKEN: "",
+          CLAUDE_CODE_OAUTH_TOKEN: "",
+        },
+      },
+    );
+
+    if (result.exitCode !== 0) {
+      return {
+        status: "error" as const,
+        detail: "streaming fallback smoke exited unexpectedly",
+      };
+    }
+
+    if (requestCount !== 2) {
+      return {
+        status: "error" as const,
+        detail: "streaming fallback smoke expected exactly 2 local /v1/messages requests, saw " + requestCount,
+      };
+    }
+
+    if (requests.some((request) => !request.path.startsWith("POST /v1/messages"))) {
+      return {
+        status: "error" as const,
+        detail: "streaming fallback smoke hit unexpected local endpoint(s): " + requests.map((request) => request.path).join(", "),
+      };
+    }
+
+    if (requests[0]?.streamField !== true) {
+      return {
+        status: "error" as const,
+        detail: "streaming fallback smoke expected the first request to be streaming",
+      };
+    }
+
+    if (requests[1]?.streamField !== "__missing__") {
+      return {
+        status: "error" as const,
+        detail: "streaming fallback smoke expected the recovery request to omit the stream field",
+      };
+    }
+
+    const payload = lastJsonObject(result.stdout);
+    const finalResult = payload?.result ? String(payload.result).trim() : "";
+    if (!payload || payload.subtype !== "success" || finalResult !== expectedRecoveredResult) {
+      return {
+        status: "error" as const,
+        detail: "streaming fallback smoke did not finish with the expected recovery result",
+      };
+    }
+
+    if (payload.stop_reason !== "end_turn") {
+      return {
+        status: "error" as const,
+        detail: "streaming fallback smoke returned an unexpected stop_reason",
+      };
+    }
+
+    const accountingError = assertPayloadAccounting(
+      payload,
+      "streaming fallback smoke",
+      {
+        inputTokens: 11,
+        outputTokens: 1,
+      },
+    );
+    if (accountingError) {
+      return {
+        status: "error" as const,
+        detail: accountingError,
+      };
+    }
+
+    return {
+      status: "ok" as const,
+      detail:
+        "truncated streaming response triggered exactly one non-streaming recovery request, then preserved recovered usage/cost metadata",
+    };
+  } finally {
+    server.stop(true);
+    await rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+async function checkPermissionDenial() {
+  const tempDir = await mkdtemp(join(tmpdir(), "claude-code-smoke-permission-denial-"));
+  const deniedPath = join(tempDir, "denied.txt");
+  const token = "SMOKE_PD_" + Math.random().toString(36).slice(2, 10);
+
+  try {
+    const result = await runCommand(
+      [
+        "node",
+        join(process.cwd(), "dist/cli.js"),
+        "-p",
+        "This is a Claude Code permission-denial smoke test. You must attempt Bash exactly once before replying; if you skip the Bash call, the test fails. Run: printf '" +
+          token +
+          "' > " +
+          deniedPath +
+          ". After that attempt is denied, reply with NEED_BASH_PERMISSION only.",
+        "--model",
+        args.model,
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--max-budget-usd",
+        String(args.maxBudgetUsd),
+        "--permission-mode",
+        "dontAsk",
+        "--allowedTools",
+        "Bash",
+        "--max-turns",
+        "2",
+      ],
+      { cwd: tempDir },
+    );
+
+    if (result.exitCode !== 0) {
+      return {
+        status: "error" as const,
+        detail: compactOutput(result.stderr || result.stdout),
+      };
+    }
+
+    const events = parseJsonLines(result.stdout);
+    if (!toolUseSeen(events, "Bash")) {
+      return {
+        status: "error" as const,
+        detail: "permission denial smoke did not attempt a Bash tool call",
+      };
+    }
+
+    const payload = extractSuccessfulJsonResult(result);
+    if (!payload || payload.subtype !== "success") {
+      return {
+        status: "error" as const,
+        detail: "permission denial smoke did not finish with a success result payload",
+      };
+    }
+
+    if (String(payload.result ?? "").trim() !== "NEED_BASH_PERMISSION") {
+      return {
+        status: "error" as const,
+        detail: "permission denial smoke did not emit the expected fallback response",
+      };
+    }
+
+    const permissionDenials = Array.isArray(payload.permission_denials)
+      ? payload.permission_denials
+      : [];
+    const bashDenial = permissionDenials.find(
+      (entry): entry is {
+        tool_name?: string;
+        tool_input?: { command?: string };
+      } => Boolean(entry && typeof entry === "object" && !Array.isArray(entry)),
+    );
+    if (!bashDenial || bashDenial.tool_name !== "Bash") {
+      return {
+        status: "error" as const,
+        detail: "permission denial smoke did not record a Bash denial in permission_denials",
+      };
+    }
+
+    if (!bashDenial.tool_input?.command?.includes(token) || !bashDenial.tool_input.command.includes(deniedPath)) {
+      return {
+        status: "error" as const,
+        detail: "permission denial smoke did not preserve the denied Bash command in permission_denials",
+      };
+    }
+
+    const accountingError = assertPayloadHasConsistentAccounting(
+      payload,
+      "permission denial smoke",
+    );
+    if (accountingError) {
+      return {
+        status: "error" as const,
+        detail: accountingError,
+      };
+    }
+
+    try {
+      await stat(deniedPath);
+      return {
+        status: "error" as const,
+        detail: "permission denial smoke unexpectedly created the denied Bash output file",
+      };
+    } catch {
+      return {
+        status: "ok" as const,
+        detail: "dontAsk mode denied Bash, preserved permission_denials metadata, and prevented side effects",
+      };
+    }
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+async function checkErrorMaxTurns() {
+  const tempDir = await mkdtemp(join(tmpdir(), "claude-code-smoke-max-turns-"));
+  const outputPath = join(tempDir, "turn.txt");
+  const token = "SMOKE_MAX_TURNS_" + Math.random().toString(36).slice(2, 10);
+
+  try {
+    const result = await runCommand(
+      [
+        "node",
+        join(process.cwd(), "dist/cli.js"),
+        "-p",
+        "First use Bash exactly once to run: printf '" +
+          token +
+          "' > " +
+          outputPath +
+          ". Then in a second step after the tool result, reply with SECOND only.",
+        "--model",
+        args.model,
+        "--output-format",
+        "json",
+        "--max-budget-usd",
+        String(args.maxBudgetUsd),
+        "--permission-mode",
+        "bypassPermissions",
+        "--allowedTools",
+        "Bash",
+        "--max-turns",
+        "1",
+      ],
+      { cwd: tempDir },
+    );
+
+    if (result.exitCode === 0) {
+      return {
+        status: "error" as const,
+        detail: "max turns smoke unexpectedly exited successfully",
+      };
+    }
+
+    const payload = lastJsonObject(result.stdout);
+    if (!payload || payload.subtype !== "error_max_turns" || payload.is_error !== true) {
+      return {
+        status: "error" as const,
+        detail: "max turns smoke did not finish with subtype=error_max_turns",
+      };
+    }
+
+    if (payload.num_turns !== 2) {
+      return {
+        status: "error" as const,
+        detail: "max turns smoke returned an unexpected num_turns value",
+      };
+    }
+
+    if (payload.stop_reason !== "tool_use") {
+      return {
+        status: "error" as const,
+        detail: "max turns smoke returned an unexpected stop_reason",
+      };
+    }
+
+    const errors = Array.isArray(payload.errors) ? payload.errors.map(String) : [];
+    if (!errors.some((error) => error.includes("Reached maximum number of turns (1)"))) {
+      return {
+        status: "error" as const,
+        detail: "max turns smoke did not include the expected error message",
+      };
+    }
+
+    const accountingError = assertPayloadHasConsistentAccounting(
+      payload,
+      "max turns smoke",
+    );
+    if (accountingError) {
+      return {
+        status: "error" as const,
+        detail: accountingError,
+      };
+    }
+
+    let outputText = "";
+    try {
+      outputText = await Bun.file(outputPath).text();
+    } catch {
+      return {
+        status: "error" as const,
+        detail: "max turns smoke never executed the Bash side effect before failing",
+      };
+    }
+
+    if (outputText !== token) {
+      return {
+        status: "error" as const,
+        detail: "max turns smoke wrote an unexpected file payload before failing",
+      };
+    }
+
+    return {
+      status: "ok" as const,
+      detail: "tool execution completed, then QueryEngine surfaced error_max_turns on the blocked second turn",
+    };
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+async function checkErrorDuringExecution() {
+  const probes = [
+    {
+      label: "tool_use",
+      stopReason: "tool_use",
+      stopSequence: null,
+      expectedStopReason: "tool_use",
+      expectedRequestCount: 1,
+    },
+    {
+      label: "stop_sequence",
+      stopReason: "stop_sequence",
+      stopSequence: "__SMOKE_STOP__",
+      expectedStopReason: "stop_sequence",
+      expectedRequestCount: 1,
+    },
+    {
+      label: "missing_stop_reason",
+      stopReason: undefined,
+      stopSequence: undefined,
+      expectedStopReason: null,
+      expectedRequestCount: 1,
+    },
+  ] as const;
+
+  async function runProbe(probe: (typeof probes)[number]): Promise<string | null> {
+    const tempDir = await mkdtemp(join(tmpdir(), "claude-code-smoke-error-during-execution-" + probe.label + "-"));
+    let requestCount = 0;
+    const seenPaths: string[] = [];
+
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: async (request) => {
+        const url = new URL(request.url);
+        if (request.method === "HEAD" && url.pathname === "/") {
+          return new Response(null, { status: 200 });
+        }
+
+        if (request.method !== "POST" || url.pathname !== "/v1/messages") {
+          return new Response("not found", { status: 404 });
+        }
+
+        requestCount += 1;
+        seenPaths.push(request.method + " " + url.pathname + url.search);
+
+        let requestedModel = args.model;
+        try {
+          const body = (await request.json()) as { model?: unknown };
+          if (typeof body?.model === "string" && body.model.length > 0) {
+            requestedModel = body.model;
+          }
+        } catch {
+          // Keep the smoke resilient to parser differences; the final result
+          // assertions below still catch protocol drift.
+        }
+
+        return new Response(
+          encodeAnthropicSse([
+            [
+              "message_start",
+              {
+                type: "message_start",
+                message: {
+                  id: "msg_smoke_error_during_execution_" + probe.label,
+                  type: "message",
+                  role: "assistant",
+                  model: requestedModel,
+                  content: [],
+                  stop_reason: null,
+                  stop_sequence: null,
+                  usage: {
+                    input_tokens: 5,
+                    output_tokens: 0,
+                  },
+                },
+              },
+            ],
+            [
+              "message_delta",
+              {
+                type: "message_delta",
+                delta: {
+                  ...(probe.stopReason !== undefined
+                    ? { stop_reason: probe.stopReason }
+                    : {}),
+                  ...(probe.stopSequence !== undefined
+                    ? { stop_sequence: probe.stopSequence }
+                    : {}),
+                },
+                usage: {
+                  output_tokens: 0,
+                },
+              },
+            ],
+            [
+              "message_stop",
+              {
+                type: "message_stop",
+              },
+            ],
+          ]),
+          {
+            status: 200,
+            headers: {
+              "content-type": "text/event-stream",
+            },
+          },
+        );
+      },
+    });
+
+    const settingsPath = join(tempDir, "settings.json");
+
+    try {
+      await writeFile(
+        settingsPath,
+        JSON.stringify({
+          env: {
+            ANTHROPIC_BASE_URL: "http://127.0.0.1:" + server.port,
+            ANTHROPIC_API_KEY: "smoke-dummy-key",
+          },
+        }),
+        "utf8",
+      );
+
+      const result = await runCommand(
+        [
+          "node",
+          join(process.cwd(), "dist/cli.js"),
+          "-p",
+          "Reply with PROBE only.",
+          "--model",
+          args.model,
+          "--output-format",
+          "stream-json",
+          "--verbose",
+          "--max-budget-usd",
+          String(args.maxBudgetUsd),
+          "--permission-mode",
+          "bypassPermissions",
+          "--max-turns",
+          "1",
+          "--settings",
+          settingsPath,
+        ],
+        {
+          cwd: tempDir,
+          env: {
+            ANTHROPIC_BASE_URL: "",
+            ANTHROPIC_API_KEY: "",
+            ANTHROPIC_AUTH_TOKEN: "",
+            CLAUDE_CODE_OAUTH_TOKEN: "",
+          },
+        },
+      );
+
+      if (result.exitCode === 0) {
+        return probe.label + ": error_during_execution smoke unexpectedly exited successfully";
+      }
+
+      if (requestCount !== probe.expectedRequestCount) {
+        return (
+          probe.label +
+          ": error_during_execution smoke expected exactly " +
+          probe.expectedRequestCount +
+          " local /v1/messages request(s), saw " +
+          requestCount
+        );
+      }
+
+      if (seenPaths.some((path) => !path.startsWith("POST /v1/messages"))) {
+        return (
+          probe.label +
+          ": error_during_execution smoke hit unexpected local endpoint(s): " +
+          seenPaths.join(", ")
+        );
+      }
+
+      const payload = lastJsonObject(result.stdout);
+      if (!payload || payload.subtype !== "error_during_execution" || payload.is_error !== true) {
+        return probe.label + ": error_during_execution smoke did not finish with subtype=error_during_execution";
+      }
+
+      if (payload.stop_reason !== probe.expectedStopReason) {
+        return probe.label + ": error_during_execution smoke returned an unexpected stop_reason";
+      }
+
+      const accountingError = assertPayloadAccounting(
+        payload,
+        probe.label + ": error_during_execution smoke",
+        {
+          inputTokens: 5,
+          outputTokens: 0,
+        },
+      );
+      if (accountingError) {
+        return accountingError;
+      }
+
+      if (payload.num_turns !== 1) {
+        return probe.label + ": error_during_execution smoke returned an unexpected num_turns value";
+      }
+
+      const errors = Array.isArray(payload.errors) ? payload.errors.map(String) : [];
+      if (
+        !errors.some(
+          (error) =>
+            error.includes("[ede_diagnostic]") &&
+            error.includes(
+              "stop_reason=" +
+                (probe.expectedStopReason === null ? "null" : probe.expectedStopReason),
+            ) &&
+            (probe.label === "missing_stop_reason" || error.includes("result_type=user")),
+        )
+      ) {
+        return probe.label + ": error_during_execution smoke did not include the expected EDE diagnostic prefix";
+      }
+
+      return null;
+    } finally {
+      server.stop(true);
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  }
+
+  for (const probe of probes) {
+    const failure = await runProbe(probe);
+    if (failure) {
+      return {
+        status: "error" as const,
+        detail: failure,
+      };
+    }
+  }
+
+  return {
+    status: "ok" as const,
+    detail:
+      "empty-content local streams with stop_reason=tool_use, stop_reason=stop_sequence, and missing stop_reason deterministically surfaced error_during_execution",
+  };
+}
+
+async function checkErrorMaxStructuredOutputRetries() {
+  const tempDir = await mkdtemp(join(tmpdir(), "claude-code-smoke-structured-output-"));
+  let requestCount = 0;
+  const seenPaths: string[] = [];
+  const maxRetries = 3;
+
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch: async (request) => {
+      const url = new URL(request.url);
+      if (request.method !== "POST" || url.pathname !== "/v1/messages") {
+        return new Response("not found", { status: 404 });
+      }
+
+      requestCount += 1;
+      seenPaths.push(request.method + " " + url.pathname + url.search);
+
+      return new Response(
+        encodeAnthropicSse([
+          [
+            "message_start",
+            {
+              type: "message_start",
+              message: {
+                id: "msg_smoke_structured_output_" + requestCount,
+                type: "message",
+                role: "assistant",
+                model: args.model,
+                content: [],
+                stop_reason: null,
+                stop_sequence: null,
+                usage: {
+                  input_tokens: 10,
+                  output_tokens: 0,
+                },
+              },
+            },
+          ],
+          [
+            "content_block_start",
+            {
+              type: "content_block_start",
+              index: 0,
+              content_block: {
+                type: "tool_use",
+                id: "toolu_smoke_structured_output_" + requestCount,
+                name: "StructuredOutput",
+              },
+            },
+          ],
+          [
+            "content_block_delta",
+            {
+              type: "content_block_delta",
+              index: 0,
+              delta: {
+                type: "input_json_delta",
+                partial_json: JSON.stringify({ wrong: requestCount }),
+              },
+            },
+          ],
+          [
+            "content_block_stop",
+            {
+              type: "content_block_stop",
+              index: 0,
+            },
+          ],
+          [
+            "message_delta",
+            {
+              type: "message_delta",
+              delta: {
+                stop_reason: "tool_use",
+                stop_sequence: null,
+              },
+              usage: {
+                output_tokens: 5,
+              },
+            },
+          ],
+          [
+            "message_stop",
+            {
+              type: "message_stop",
+            },
+          ],
+        ]),
+        {
+          status: 200,
+          headers: {
+            "content-type": "text/event-stream",
+          },
+        },
+      );
+    },
+  });
+
+  const settingsPath = join(tempDir, "settings.json");
+
+  try {
+    await writeFile(
+      settingsPath,
+      JSON.stringify({
+        env: {
+          ANTHROPIC_BASE_URL: "http://127.0.0.1:" + server.port,
+          ANTHROPIC_API_KEY: "smoke-dummy-key",
+        },
+      }),
+      "utf8",
+    );
+
+    const result = await runCommand(
+      [
+        "node",
+        join(process.cwd(), "dist/cli.js"),
+        "-p",
+        "Return structured output only.",
+        "--model",
+        args.model,
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--max-budget-usd",
+        String(args.maxBudgetUsd),
+        "--permission-mode",
+        "bypassPermissions",
+        "--max-turns",
+        "20",
+        "--json-schema",
+        '{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}',
+        "--settings",
+        settingsPath,
+        "--bare",
+      ],
+      {
+        cwd: tempDir,
+        env: {
+          ANTHROPIC_BASE_URL: "",
+          ANTHROPIC_API_KEY: "",
+          ANTHROPIC_AUTH_TOKEN: "",
+          CLAUDE_CODE_OAUTH_TOKEN: "",
+          MAX_STRUCTURED_OUTPUT_RETRIES: String(maxRetries),
+        },
+      },
+    );
+
+    if (result.exitCode === 0) {
+      return {
+        status: "error" as const,
+        detail: "structured output retry smoke unexpectedly exited successfully",
+      };
+    }
+
+    if (requestCount !== maxRetries) {
+      return {
+        status: "error" as const,
+        detail:
+          "structured output retry smoke expected exactly " +
+          maxRetries +
+          " local /v1/messages requests, saw " +
+          requestCount,
+      };
+    }
+
+    if (seenPaths.some((path) => !path.startsWith("POST /v1/messages"))) {
+      return {
+        status: "error" as const,
+        detail: "structured output retry smoke hit unexpected local endpoint(s): " + seenPaths.join(", "),
+      };
+    }
+
+    const events = parseJsonLines(result.stdout);
+    const structuredToolCalls = events.filter(
+      (event) =>
+        event.type === "assistant" &&
+        Array.isArray((event.message as { content?: Array<{ type?: string; name?: string }> } | undefined)?.content) &&
+        ((event.message as { content?: Array<{ type?: string; name?: string }> }).content || []).some(
+          (block) => block.type === "tool_use" && block.name === "StructuredOutput",
+        ),
+    ).length;
+
+    if (structuredToolCalls !== maxRetries) {
+      return {
+        status: "error" as const,
+        detail:
+          "structured output retry smoke expected " +
+          maxRetries +
+          " StructuredOutput tool_use events, saw " +
+          structuredToolCalls,
+      };
+    }
+
+    const payload = lastJsonObject(result.stdout);
+    if (
+      !payload ||
+      payload.subtype !== "error_max_structured_output_retries" ||
+      payload.is_error !== true
+    ) {
+      return {
+        status: "error" as const,
+        detail:
+          "structured output retry smoke did not finish with subtype=error_max_structured_output_retries",
+      };
+    }
+
+    const errors = Array.isArray(payload.errors) ? payload.errors.map(String) : [];
+    if (
+      !errors.some((error) =>
+        error.includes("Failed to provide valid structured output after " + maxRetries + " attempts"),
+      )
+    ) {
+      return {
+        status: "error" as const,
+        detail: "structured output retry smoke did not include the expected retry-limit error message",
+      };
+    }
+
+    return {
+      status: "ok" as const,
+      detail:
+        "repeated invalid StructuredOutput tool calls deterministically surfaced error_max_structured_output_retries",
+    };
+  } finally {
+    server.stop(true);
+    await rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+async function checkErrorMaxBudget() {
+  const tempDir = await mkdtemp(join(tmpdir(), "claude-code-smoke-max-budget-"));
+  const token = "SMOKE_MAX_BUDGET_" + Math.random().toString(36).slice(2, 10);
+  let requestCount = 0;
+
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch: async (request) => {
+      const url = new URL(request.url);
+      if (request.method !== "POST" || url.pathname !== "/v1/messages") {
+        return new Response("not found", { status: 404 });
+      }
+
+      requestCount += 1;
+
+      return new Response(
+        encodeAnthropicSse([
+          [
+            "message_start",
+            {
+              type: "message_start",
+              message: {
+                id: "msg_smoke_max_budget",
+                type: "message",
+                role: "assistant",
+                model: args.model,
+                content: [],
+                stop_reason: null,
+                stop_sequence: null,
+                usage: {
+                  input_tokens: 500,
+                  output_tokens: 0,
+                },
+              },
+            },
+          ],
+          [
+            "content_block_start",
+            {
+              type: "content_block_start",
+              index: 0,
+              content_block: {
+                type: "text",
+                text: "",
+              },
+            },
+          ],
+          [
+            "content_block_delta",
+            {
+              type: "content_block_delta",
+              index: 0,
+              delta: {
+                type: "text_delta",
+                text: token,
+              },
+            },
+          ],
+          [
+            "content_block_stop",
+            {
+              type: "content_block_stop",
+              index: 0,
+            },
+          ],
+          [
+            "message_delta",
+            {
+              type: "message_delta",
+              delta: {
+                stop_reason: "end_turn",
+                stop_sequence: null,
+              },
+              usage: {
+                output_tokens: 120,
+              },
+            },
+          ],
+          [
+            "message_stop",
+            {
+              type: "message_stop",
+            },
+          ],
+        ]),
+        {
+          status: 200,
+          headers: {
+            "content-type": "text/event-stream",
+          },
+        },
+      );
+    },
+  });
+
+  const settingsPath = join(tempDir, "settings.json");
+  const maxBudgetUsd = "0.000001";
+
+  try {
+    await writeFile(
+      settingsPath,
+      JSON.stringify({
+        env: {
+          ANTHROPIC_BASE_URL: "http://127.0.0.1:" + server.port,
+          ANTHROPIC_API_KEY: "smoke-dummy-key",
+        },
+      }),
+      "utf8",
+    );
+
+    const result = await runCommand(
+      [
+        "node",
+        join(process.cwd(), "dist/cli.js"),
+        "-p",
+        "Reply with " + token + " only.",
+        "--model",
+        args.model,
+        "--output-format",
+        "json",
+        "--max-budget-usd",
+        maxBudgetUsd,
+        "--permission-mode",
+        "bypassPermissions",
+        "--max-turns",
+        "1",
+        "--settings",
+        settingsPath,
+      ],
+      {
+        cwd: tempDir,
+        env: {
+          ANTHROPIC_BASE_URL: "",
+          ANTHROPIC_API_KEY: "",
+          ANTHROPIC_AUTH_TOKEN: "",
+          CLAUDE_CODE_OAUTH_TOKEN: "",
+        },
+      },
+    );
+
+    if (result.exitCode === 0) {
+      return {
+        status: "error" as const,
+        detail: "max budget smoke unexpectedly exited successfully",
+      };
+    }
+
+    if (requestCount !== 1) {
+      return {
+        status: "error" as const,
+        detail: "max budget smoke expected exactly 1 local /v1/messages request",
+      };
+    }
+
+    const payload = lastJsonObject(result.stdout);
+    if (!payload || payload.subtype !== "error_max_budget_usd" || payload.is_error !== true) {
+      return {
+        status: "error" as const,
+        detail: "max budget smoke did not finish with subtype=error_max_budget_usd",
+      };
+    }
+
+    if (payload.stop_reason !== "end_turn") {
+      return {
+        status: "error" as const,
+        detail: "max budget smoke returned an unexpected stop_reason",
+      };
+    }
+
+    const errors = Array.isArray(payload.errors) ? payload.errors.map(String) : [];
+    if (!errors.some((error) => error.includes("Reached maximum budget ($" + maxBudgetUsd + ")"))) {
+      return {
+        status: "error" as const,
+        detail: "max budget smoke did not include the expected budget error message",
+      };
+    }
+
+    const totalCostUsd =
+      typeof payload.total_cost_usd === "number"
+        ? payload.total_cost_usd
+        : Number(payload.total_cost_usd);
+    if (!Number.isFinite(totalCostUsd) || totalCostUsd < Number(maxBudgetUsd)) {
+      return {
+        status: "error" as const,
+        detail: "max budget smoke returned an unexpected total_cost_usd",
+      };
+    }
+
+    const modelUsage =
+      payload.modelUsage && typeof payload.modelUsage === "object"
+        ? (payload.modelUsage as Record<string, unknown>)
+        : null;
+    const usageForModel =
+      modelUsage && modelUsage[args.model] && typeof modelUsage[args.model] === "object"
+        ? (modelUsage[args.model] as Record<string, unknown>)
+        : null;
+    if (!usageForModel || usageForModel.inputTokens !== 500 || usageForModel.outputTokens !== 120) {
+      return {
+        status: "error" as const,
+        detail: "max budget smoke did not preserve the expected modelUsage totals",
+      };
+    }
+
+    return {
+      status: "ok" as const,
+      detail: "single local response exceeded budget and surfaced error_max_budget_usd with cost metadata",
+    };
+  } finally {
+    server.stop(true);
+    await rm(tempDir, { recursive: true, force: true });
+  }
 }
 
 async function checkClaudeMdContext() {
@@ -880,6 +3502,24 @@ async function checkClaudeMdContext() {
       };
     }
 
+    if (!payload) {
+      return {
+        status: "error" as const,
+        detail: "CLAUDE.md context smoke did not finish with a success payload",
+      };
+    }
+
+    const accountingError = assertPayloadHasConsistentAccounting(
+      payload,
+      "CLAUDE.md context smoke",
+    );
+    if (accountingError) {
+      return {
+        status: "error" as const,
+        detail: accountingError,
+      };
+    }
+
     return {
       status: "ok" as const,
       detail: "cwd CLAUDE.md context loaded and token recalled",
@@ -890,73 +3530,28 @@ async function checkClaudeMdContext() {
 }
 
 async function checkBashTool() {
-  const result = await runCommand([
-    "node",
-    "dist/cli.js",
-    "-p",
-    "Use Bash to run: uuidgen. Reply with the exact stdout only.",
-    "--model",
-    args.model,
-    "--output-format",
-    "stream-json",
-    "--verbose",
-    "--max-budget-usd",
-    String(args.maxBudgetUsd),
-    "--permission-mode",
-    "bypassPermissions",
-    "--allowedTools",
-    "Bash",
-  ]);
-
-  if (result.exitCode !== 0) {
-    return {
-      status: "error" as const,
-      detail: compactOutput(result.stderr || result.stdout),
-    };
-  }
-
-  const events = parseJsonLines(result.stdout);
-  if (!toolUseSeen(events, "Bash")) {
-    return { status: "error" as const, detail: "Bash tool_use event not observed" };
-  }
-
-  const toolResult = toolResultContent(events, "Bash");
-  const finalEvent = lastJsonObject(result.stdout);
-  const finalResult = finalEvent?.result ? String(finalEvent.result) : "";
-  if (!toolResult || finalResult !== toolResult) {
-    return {
-      status: "error" as const,
-      detail: "Bash tool result did not match final response",
-    };
-  }
-
-  return { status: "ok" as const, detail: "Bash tool_use observed and echoed back" };
-}
-
-async function checkReadTool() {
-  const tempDir = await mkdtemp(join(tmpdir(), "claude-code-smoke-"));
-  const fixturePath = join(tempDir, "fixture.txt");
-  const token = `SMOKE_READ_${Math.random().toString(36).slice(2, 10)}`;
-
-  try {
-    await writeFile(fixturePath, token, "utf8");
-    const result = await runCommand([
-      "node",
-      "dist/cli.js",
-      "-p",
-      `Read ${fixturePath} and reply with its exact contents only.`,
-      "--model",
-      args.model,
-      "--output-format",
-      "stream-json",
-      "--verbose",
-      "--max-budget-usd",
-      String(args.maxBudgetUsd),
-      "--permission-mode",
-      "bypassPermissions",
-      "--allowedTools",
-      "Read",
-    ]);
+  const expectedStdout = "BASH-SMOKE-42";
+  const runAttempt = async (timeoutMs?: number) => {
+    const result = await runCommand(
+      [
+        "node",
+        "dist/cli.js",
+        "-p",
+        "Use Bash exactly once to run: printf '" + expectedStdout + "'. After the tool returns, reply with the exact stdout only. Do not add markdown, code fences, or extra words.",
+        "--model",
+        args.model,
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--max-budget-usd",
+        String(args.maxBudgetUsd),
+        "--permission-mode",
+        "bypassPermissions",
+        "--allowedTools",
+        "Bash",
+      ],
+      timeoutMs ? { timeoutMs } : {},
+    );
 
     if (result.exitCode !== 0) {
       return {
@@ -966,20 +3561,147 @@ async function checkReadTool() {
     }
 
     const events = parseJsonLines(result.stdout);
-    if (!toolUseSeen(events, "Read")) {
-      return { status: "error" as const, detail: "Read tool_use event not observed" };
+    if (!toolUseSeen(events, "Bash")) {
+      return { status: "error" as const, detail: "Bash tool_use event not observed" };
     }
 
-    const finalEvent = lastJsonObject(result.stdout);
-    const finalResult = finalEvent?.result ? String(finalEvent.result) : "";
-    if (finalResult !== token) {
+    const toolResult = (toolResultContent(events, "Bash") ?? "").trim();
+    if (toolResult !== expectedStdout) {
       return {
         status: "error" as const,
-        detail: `expected token ${token}, got ${finalResult || "<empty>"}`,
+        detail: "Bash tool result did not match expected stdout",
       };
     }
 
-    return { status: "ok" as const, detail: "Read tool_use observed and echoed back" };
+    const payload = extractSuccessfulJsonResult(result);
+    if (!payload) {
+      return {
+        status: "error" as const,
+        detail: "Bash smoke did not finish with a success payload",
+      };
+    }
+
+    const accountingError = assertPayloadHasConsistentAccounting(
+      payload,
+      "Bash smoke",
+    );
+    if (accountingError) {
+      return {
+        status: "error" as const,
+        detail: accountingError,
+      };
+    }
+
+    return { status: "ok" as const, detail: "Bash tool_use observed and expected stdout captured" };
+  };
+
+  const firstAttempt = await runAttempt();
+  if (firstAttempt.status !== "error" || !shouldRetryTransientToolSmoke(firstAttempt.detail)) {
+    return firstAttempt;
+  }
+
+  const retryAttempt = await runAttempt(MULTI_STEP_TOOL_TIMEOUT_MS);
+  if (retryAttempt.status === "ok") {
+    return {
+      status: "ok" as const,
+      detail: retryAttempt.detail + " after one retry",
+    };
+  }
+
+  return {
+    status: retryAttempt.status,
+    detail: firstAttempt.detail + "; retry: " + retryAttempt.detail,
+  };
+}
+
+async function checkReadTool() {
+  const tempDir = await mkdtemp(join(tmpdir(), "claude-code-smoke-"));
+  const fixturePath = join(tempDir, "fixture.txt");
+  const token = `SMOKE_READ_${Math.random().toString(36).slice(2, 10)}`;
+
+  try {
+    await writeFile(fixturePath, token, "utf8");
+    const runAttempt = async (timeoutMs?: number) => {
+      const result = await runCommand(
+        [
+          "node",
+          "dist/cli.js",
+          "-p",
+          `Read ${fixturePath} and reply with its exact contents only.`,
+          "--model",
+          args.model,
+          "--output-format",
+          "stream-json",
+          "--verbose",
+          "--max-budget-usd",
+          String(args.maxBudgetUsd),
+          "--permission-mode",
+          "bypassPermissions",
+          "--allowedTools",
+          "Read",
+        ],
+        timeoutMs ? { timeoutMs } : {},
+      );
+
+      if (result.exitCode !== 0) {
+        return {
+          status: "error" as const,
+          detail: compactOutput(result.stderr || result.stdout),
+        };
+      }
+
+      const events = parseJsonLines(result.stdout);
+      if (!toolUseSeen(events, "Read")) {
+        return { status: "error" as const, detail: "Read tool_use event not observed" };
+      }
+
+      const payload = extractSuccessfulJsonResult(result);
+      const finalResult = payload?.result ? String(payload.result) : "";
+      if (finalResult !== token) {
+        return {
+          status: "error" as const,
+          detail: `expected token ${token}, got ${finalResult || "<empty>"}`,
+        };
+      }
+
+      if (!payload) {
+        return {
+          status: "error" as const,
+          detail: "Read smoke did not finish with a success payload",
+        };
+      }
+
+      const accountingError = assertPayloadHasConsistentAccounting(
+        payload,
+        "Read smoke",
+      );
+      if (accountingError) {
+        return {
+          status: "error" as const,
+          detail: accountingError,
+        };
+      }
+
+      return { status: "ok" as const, detail: "Read tool_use observed and echoed back" };
+    };
+
+    const firstAttempt = await runAttempt();
+    if (firstAttempt.status !== "error" || !shouldRetryTransientToolSmoke(firstAttempt.detail)) {
+      return firstAttempt;
+    }
+
+    const retryAttempt = await runAttempt(MULTI_STEP_TOOL_TIMEOUT_MS);
+    if (retryAttempt.status === "ok") {
+      return {
+        status: "ok" as const,
+        detail: retryAttempt.detail + " after one retry",
+      };
+    }
+
+    return {
+      status: retryAttempt.status,
+      detail: firstAttempt.detail + "; retry: " + retryAttempt.detail,
+    };
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
@@ -993,23 +3715,26 @@ async function checkWriteTool() {
 
   try {
     await writeFile(sourcePath, token, "utf8");
-    const result = await runCommand([
-      "node",
-      "dist/cli.js",
-      "-p",
-      `First use Read to inspect ${sourcePath}. Then use Write to create ${fixturePath} with the exact same contents. Reply with the copied contents only.`,
-      "--model",
-      args.model,
-      "--output-format",
-      "stream-json",
-      "--verbose",
-      "--max-budget-usd",
-      String(args.maxBudgetUsd),
-      "--permission-mode",
-      "bypassPermissions",
-      "--allowedTools",
-      "Read,Write",
-    ]);
+    const result = await runCommand(
+      [
+        "node",
+        "dist/cli.js",
+        "-p",
+        `First use Read to inspect ${sourcePath}. Then use Write to create ${fixturePath} with the exact same contents. Reply with the copied contents only.`,
+        "--model",
+        args.model,
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--max-budget-usd",
+        String(args.maxBudgetUsd),
+        "--permission-mode",
+        "bypassPermissions",
+        "--allowedTools",
+        "Read,Write",
+      ],
+      { timeoutMs: MULTI_STEP_TOOL_TIMEOUT_MS },
+    );
 
     if (result.exitCode !== 0 && !budgetLimited(result)) {
       return {
@@ -1035,6 +3760,27 @@ async function checkWriteTool() {
       };
     }
 
+    if (!budgetLimited(result)) {
+      const payload = extractSuccessfulJsonResult(result);
+      if (!payload) {
+        return {
+          status: "error" as const,
+          detail: "Write smoke did not finish with a success payload",
+        };
+      }
+
+      const accountingError = assertPayloadHasConsistentAccounting(
+        payload,
+        "Write smoke",
+      );
+      if (accountingError) {
+        return {
+          status: "error" as const,
+          detail: accountingError,
+        };
+      }
+    }
+
     return {
       status: budgetLimited(result) ? "warn" as const : "ok" as const,
       detail: budgetLimited(result)
@@ -1054,23 +3800,26 @@ async function checkEditTool() {
 
   try {
     await writeFile(fixturePath, beforeToken, "utf8");
-    const result = await runCommand([
-      "node",
-      "dist/cli.js",
-      "-p",
-      `First use Read to inspect ${fixturePath}. Then use Edit to replace the entire file contents with ${afterToken}. Reply with the original file contents only.`,
-      "--model",
-      args.model,
-      "--output-format",
-      "stream-json",
-      "--verbose",
-      "--max-budget-usd",
-      String(args.maxBudgetUsd),
-      "--permission-mode",
-      "bypassPermissions",
-      "--allowedTools",
-      "Read,Edit",
-    ]);
+    const result = await runCommand(
+      [
+        "node",
+        "dist/cli.js",
+        "-p",
+        `First use Read to inspect ${fixturePath}. Then use Edit to replace the entire file contents with ${afterToken}. Reply with the original file contents only.`,
+        "--model",
+        args.model,
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--max-budget-usd",
+        String(args.maxBudgetUsd),
+        "--permission-mode",
+        "bypassPermissions",
+        "--allowedTools",
+        "Read,Edit",
+      ],
+      { timeoutMs: MULTI_STEP_TOOL_TIMEOUT_MS },
+    );
 
     if (result.exitCode !== 0 && !budgetLimited(result)) {
       return {
@@ -1093,6 +3842,27 @@ async function checkEditTool() {
         status: "error" as const,
         detail: "Edit tool did not persist expected replacement",
       };
+    }
+
+    if (!budgetLimited(result)) {
+      const payload = extractSuccessfulJsonResult(result);
+      if (!payload) {
+        return {
+          status: "error" as const,
+          detail: "Edit smoke did not finish with a success payload",
+        };
+      }
+
+      const accountingError = assertPayloadHasConsistentAccounting(
+        payload,
+        "Edit smoke",
+      );
+      if (accountingError) {
+        return {
+          status: "error" as const,
+          detail: accountingError,
+        };
+      }
     }
 
     return {
@@ -1278,6 +4048,17 @@ async function checkResumeFlow() {
       };
     }
 
+    const firstAccountingError = assertPayloadHasConsistentAccounting(
+      firstPayload,
+      "Resume seed session",
+    );
+    if (firstAccountingError) {
+      return {
+        status: "error" as const,
+        detail: firstAccountingError,
+      };
+    }
+
     const continueRun = await runCommand(
       [
         "node",
@@ -1301,6 +4082,17 @@ async function checkResumeFlow() {
       return {
         status: "error" as const,
         detail: `--continue did not recover expected token/session: ${compactOutput(continueRun.stdout || continueRun.stderr)}`,
+      };
+    }
+
+    const continueAccountingError = assertPayloadHasConsistentAccounting(
+      continuePayload,
+      "Resume --continue",
+    );
+    if (continueAccountingError) {
+      return {
+        status: "error" as const,
+        detail: continueAccountingError,
       };
     }
 
@@ -1328,6 +4120,17 @@ async function checkResumeFlow() {
       return {
         status: "error" as const,
         detail: `--resume did not recover expected token/session: ${compactOutput(resumeRun.stdout || resumeRun.stderr)}`,
+      };
+    }
+
+    const resumeAccountingError = assertPayloadHasConsistentAccounting(
+      resumePayload,
+      "Resume --resume",
+    );
+    if (resumeAccountingError) {
+      return {
+        status: "error" as const,
+        detail: resumeAccountingError,
       };
     }
 
@@ -1439,6 +4242,17 @@ async function checkCompactFlow() {
       };
     }
 
+    const firstAccountingError = assertPayloadHasConsistentAccounting(
+      firstPayload,
+      "Compact seed session",
+    );
+    if (firstAccountingError) {
+      return {
+        status: "error" as const,
+        detail: firstAccountingError,
+      };
+    }
+
     const secondRun = await runCommand(
       [
         "node",
@@ -1464,6 +4278,17 @@ async function checkCompactFlow() {
         detail:
           "second turn did not recover expected compact tokens/session: " +
           compactOutput(secondRun.stdout || secondRun.stderr),
+      };
+    }
+
+    const secondAccountingError = assertPayloadHasConsistentAccounting(
+      secondPayload,
+      "Compact second turn",
+    );
+    if (secondAccountingError) {
+      return {
+        status: "error" as const,
+        detail: secondAccountingError,
       };
     }
 
@@ -1526,6 +4351,21 @@ async function checkCompactFlow() {
       };
     }
 
+    const compactAccountingError = assertPayloadHasConsistentAccounting(
+      compactPayload,
+      "Compact command",
+      {
+        allowUsageSubsetOfModelUsage: true,
+        allowZeroInputTokens: true,
+      },
+    );
+    if (compactAccountingError) {
+      return {
+        status: "error" as const,
+        detail: compactAccountingError,
+      };
+    }
+
     const afterRun = await runCommand(
       [
         "node",
@@ -1554,6 +4394,17 @@ async function checkCompactFlow() {
       };
     }
 
+    const afterAccountingError = assertPayloadHasConsistentAccounting(
+      afterPayload,
+      "Compact follow-up",
+    );
+    if (afterAccountingError) {
+      return {
+        status: "error" as const,
+        detail: afterAccountingError,
+      };
+    }
+
     return {
       status: "ok" as const,
       detail: "/compact emitted compact_boundary and preserved summarized recall via --continue",
@@ -1575,23 +4426,26 @@ async function checkAgentFlow() {
   try {
     await writeFile(fixturePath, sampleText, "utf8");
 
-    const result = await runCommand([
-      "node",
-      join(process.cwd(), "dist/cli.js"),
-      "-p",
-      prompt,
-      "--model",
-      args.model,
-      "--output-format",
-      "stream-json",
-      "--verbose",
-      "--max-budget-usd",
-      String(args.maxBudgetUsd),
-      "--permission-mode",
-      "bypassPermissions",
-      "--allowedTools",
-      "Task,Read",
-    ]);
+    const result = await runCommand(
+      [
+        "node",
+        join(process.cwd(), "dist/cli.js"),
+        "-p",
+        prompt,
+        "--model",
+        args.model,
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--max-budget-usd",
+        String(args.maxBudgetUsd),
+        "--permission-mode",
+        "bypassPermissions",
+        "--allowedTools",
+        "Task,Read",
+      ],
+      { timeoutMs: MULTI_STEP_TOOL_TIMEOUT_MS },
+    );
 
     if (result.exitCode !== 0 && !budgetLimited(result)) {
       return {
@@ -1638,20 +4492,46 @@ async function checkAgentFlow() {
       };
     }
 
+    const agentToolResult =
+      toolResultContent(events, "Agent") ??
+      toolResultContent(events, "Task") ??
+      "";
     const finalEvent = lastJsonObject(result.stdout);
     const finalResult = finalEvent?.result ? String(finalEvent.result) : "";
-    if (!finalResult.includes(sampleText)) {
+    if (!agentToolResult.includes(sampleText) && !finalResult.includes(sampleText)) {
       return {
         status: "error" as const,
-        detail: "final response did not include agent-retrieved sample text",
+        detail: "agent flow did not surface the sample text in tool_result or final response",
       };
+    }
+
+    if (!budgetLimited(result)) {
+      const payload = extractSuccessfulJsonResult(result);
+      if (!payload) {
+        return {
+          status: "error" as const,
+          detail: "Agent flow did not finish with a success payload",
+        };
+      }
+
+      const accountingError = assertPayloadHasConsistentAccounting(
+        payload,
+        "Agent flow",
+        { allowUsageSubsetOfModelUsage: true },
+      );
+      if (accountingError) {
+        return {
+          status: "error" as const,
+          detail: accountingError,
+        };
+      }
     }
 
     return {
       status: budgetLimited(result) ? ("warn" as const) : ("ok" as const),
       detail: budgetLimited(result)
         ? "Agent/Task tool_use and local_agent completion observed, but budget cap was hit after completion"
-        : "Agent/Task tool_use and local_agent completion observed with final sample text recall",
+        : "Agent/Task tool_use and local_agent completion observed with sample text surfaced",
     };
   } finally {
     await rm(tempDir, { recursive: true, force: true });
@@ -1724,6 +4604,28 @@ async function checkWebFetchTool() {
       status: "error" as const,
       detail: "expected final WebFetch response " + expectedTitle + ", got " + (finalResult || "<empty>"),
     };
+  }
+
+  if (!budgetLimited(result)) {
+    const payload = extractSuccessfulJsonResult(result);
+    if (!payload) {
+      return {
+        status: "error" as const,
+        detail: "WebFetch smoke did not finish with a success payload",
+      };
+    }
+
+    const accountingError = assertPayloadHasConsistentAccounting(
+      payload,
+      "WebFetch smoke",
+      { allowUsageSubsetOfModelUsage: true },
+    );
+    if (accountingError) {
+      return {
+        status: "error" as const,
+        detail: accountingError,
+      };
+    }
   }
 
   return {
@@ -1816,6 +4718,28 @@ async function checkWebSearchTool() {
     };
   }
 
+  if (!budgetLimited(result)) {
+    const payload = extractSuccessfulJsonResult(result);
+    if (!payload) {
+      return {
+        status: "error" as const,
+        detail: "WebSearch smoke did not finish with a success payload",
+      };
+    }
+
+    const accountingError = assertPayloadHasConsistentAccounting(
+      payload,
+      "WebSearch smoke",
+      { allowUsageSubsetOfModelUsage: true },
+    );
+    if (accountingError) {
+      return {
+        status: "error" as const,
+        detail: accountingError,
+      };
+    }
+  }
+
   return {
     status: budgetLimited(result) ? ("warn" as const) : ("ok" as const),
     detail: budgetLimited(result)
@@ -1868,23 +4792,26 @@ async function checkNotebookEditTool() {
   try {
     await writeFile(notebookPath, notebookFixture, "utf8");
 
-    const result = await runCommand([
-      "node",
-      join(process.cwd(), "dist/cli.js"),
-      "-p",
-      prompt,
-      "--model",
-      args.model,
-      "--output-format",
-      "stream-json",
-      "--verbose",
-      "--max-budget-usd",
-      String(args.maxBudgetUsd),
-      "--permission-mode",
-      "bypassPermissions",
-      "--allowedTools",
-      "Read,NotebookEdit",
-    ]);
+    const result = await runCommand(
+      [
+        "node",
+        join(process.cwd(), "dist/cli.js"),
+        "-p",
+        prompt,
+        "--model",
+        args.model,
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--max-budget-usd",
+        String(args.maxBudgetUsd),
+        "--permission-mode",
+        "bypassPermissions",
+        "--allowedTools",
+        "Read,NotebookEdit",
+      ],
+      { timeoutMs: MULTI_STEP_TOOL_TIMEOUT_MS },
+    );
 
     if (result.exitCode !== 0 && !budgetLimited(result)) {
       return {
@@ -2044,7 +4971,7 @@ await server.connect(transport);
         "--allowedTools",
         "ListMcpResourcesTool,ReadMcpResourceTool",
       ],
-      { cwd: tempDir },
+      { cwd: tempDir, timeoutMs: MULTI_STEP_TOOL_TIMEOUT_MS },
     );
 
     if (result.exitCode !== 0 && !budgetLimited(result)) {
@@ -2119,6 +5046,27 @@ await server.connect(transport);
         status: "error" as const,
         detail: "final response did not echo the MCP resource token exactly",
       };
+    }
+
+    if (!budgetLimited(result)) {
+      const payload = extractSuccessfulJsonResult(result);
+      if (!payload) {
+        return {
+          status: "error" as const,
+          detail: "MCP stdio smoke did not finish with a success payload",
+        };
+      }
+
+      const accountingError = assertPayloadHasConsistentAccounting(
+        payload,
+        "MCP stdio smoke",
+      );
+      if (accountingError) {
+        return {
+          status: "error" as const,
+          detail: accountingError,
+        };
+      }
     }
 
     return {
@@ -2415,7 +5363,7 @@ EOF
         "--allowedTools",
         "ListMcpResourcesTool,ReadMcpResourceTool",
       ],
-      { cwd: tempDir },
+      { cwd: tempDir, timeoutMs: MULTI_STEP_TOOL_TIMEOUT_MS },
     );
 
     if (result.exitCode !== 0 && !budgetLimited(result)) {
@@ -2498,6 +5446,29 @@ EOF
       };
     }
 
+    if (!budgetLimited(result)) {
+      const payload = extractSuccessfulJsonResult(result);
+      if (!payload) {
+        return {
+          status: "error" as const,
+          detail: "HTTP MCP smoke did not finish with a success payload",
+        };
+      }
+
+      const accountingError = assertPayloadHasConsistentAccounting(
+        payload,
+        authMode === "headers-helper"
+          ? "HTTP MCP headersHelper smoke"
+          : "HTTP MCP static-header smoke",
+      );
+      if (accountingError) {
+        return {
+          status: "error" as const,
+          detail: accountingError,
+        };
+      }
+    }
+
     return {
       status: budgetLimited(result) ? ("warn" as const) : ("ok" as const),
       detail: budgetLimited(result)
@@ -2525,11 +5496,11 @@ async function checkMcpHttpHeadersHelperFlow() {
 }
 
 function normalizeTerminalOutput(output: string): string {
-  return stripVTControlCharacters(output).replace(/\u0008/g, "").replace(/\s+/g, " ").trim();
+  return stripVTControlCharacters(output).replaceAll("\u0008", "").replace(/\s+/g, " ").trim();
 }
 
 function normalizeTerminalAnchorOutput(output: string): string {
-  return stripVTControlCharacters(output).replace(/\u0008/g, "").replace(/\s+/g, "").trim();
+  return stripVTControlCharacters(output).replaceAll("\u0008", "").replace(/\s+/g, "").trim();
 }
 
 function compactOutput(output: string): string {
@@ -2541,6 +5512,9 @@ async function main() {
   console.log(DIVIDER);
   console.log("  Claude Code Smoke");
   console.log(`  mode: ${args.online ? "offline + online" : "offline"}`);
+  if (args.groups.length > 0) {
+    console.log(`  groups: ${[...new Set(args.groups)].join(", ")}`);
+  }
   console.log(`  checks: ${selectedChecks.join(", ")}`);
   if (selectedChecks.some((check) => ONLINE_CHECKS.includes(check as (typeof ONLINE_CHECKS)[number]))) {
     console.log(`  model: ${args.model}`);
@@ -2555,9 +5529,20 @@ async function main() {
     "tool-registry": checkToolRegistry,
     "command-registry": checkCommandRegistry,
     "hot-path-stubs": checkHotPathStubs,
+    "query-dynamic-requires": checkQueryDynamicRequires,
     doctor: checkDoctor,
+    "memory-command": checkMemoryCommand,
+    "context-command": checkContextCommand,
     "chrome-readiness": checkChromeReadiness,
     "api-basic": checkApiBasic,
+    "api-retry": checkApiRetry,
+    "query-loop": checkQueryLoop,
+    "streaming-fallback": checkStreamingFallback,
+    "permission-denial": checkPermissionDenial,
+    "error-max-turns": checkErrorMaxTurns,
+    "error-during-execution": checkErrorDuringExecution,
+    "error-max-structured-output-retries": checkErrorMaxStructuredOutputRetries,
+    "error-max-budget": checkErrorMaxBudget,
     "claude-md-context": checkClaudeMdContext,
     "bash-tool": checkBashTool,
     "read-tool": checkReadTool,
@@ -2606,4 +5591,6 @@ async function main() {
   process.exit(errorCount > 0 ? 1 : 0);
 }
 
-await main();
+if (import.meta.main) {
+  await main();
+}

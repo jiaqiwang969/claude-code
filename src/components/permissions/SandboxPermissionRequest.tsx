@@ -24,14 +24,14 @@ export function SandboxPermissionRequest(t0) {
   let t2;
   if ($[0] !== onUserResponse) {
     t2 = function onSelect(value) {
-      bb4: switch (value) {
+      switch (value) {
         case "yes":
           {
             onUserResponse({
               allow: true,
               persistToSettings: false
             });
-            break bb4;
+            break;
           }
         case "yes-dont-ask-again":
           {
@@ -39,7 +39,7 @@ export function SandboxPermissionRequest(t0) {
               allow: true,
               persistToSettings: true
             });
-            break bb4;
+            break;
           }
         case "no":
           {

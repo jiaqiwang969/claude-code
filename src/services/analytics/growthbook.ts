@@ -739,6 +739,11 @@ export function getFeatureValue_CACHED_MAY_BE_STALE<T>(
   const memorySystemDefaults: Record<string, unknown> = {
     'tengu_passport_quail': true,
     'tengu_onyx_plover': { enabled: true, minHours: 24, minSessions: 5 },
+    'tengu_kairos': true,
+    'tengu_kairos_brief': true,
+    'tengu_kairos_brief_config': { enabled: true },
+    'tengu_kairos_cron': { enabled: true, intervalMinutes: 5 },
+    'tengu_kairos_cron_durable': true,
   }
   if (feature in memorySystemDefaults) {
     return memorySystemDefaults[feature] as T

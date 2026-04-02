@@ -150,7 +150,6 @@ export function NativeAutoUpdater({
     // instead so the guard is always current without changing callback
     // identity (which would re-trigger the initial-check useEffect below).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    // biome-ignore lint/correctness/useExhaustiveDependencies: isUpdating read via ref
   }, [onAutoUpdaterResult, channel]);
 
   // Initial check
@@ -184,7 +183,7 @@ export function NativeAutoUpdater({
       {autoUpdaterResult?.status === 'install_failed' && <Text color="error" wrap="truncate">
           ✗ Auto-update failed &middot; Try <Text bold>/status</Text>
         </Text>}
-      {maxVersionIssue && "ant" === 'ant' && <Text color="warning">
+      {maxVersionIssue && process.env.USER_TYPE === 'ant' && <Text color="warning">
           ⚠ Known issue: {maxVersionIssue} &middot; Run{' '}
           <Text bold>claude rollback --safe</Text> to downgrade
         </Text>}

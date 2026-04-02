@@ -9,28 +9,34 @@
   - package 源码已恢复
   - setup 层会基于 `BROWSER_TOOLS` 是否非空判断是否暴露能力
   - client 层仍保留 in-process server 形状校验，防止未来又退化成空对象
-- 本机环境已推进到“host 已安装、扩展未安装”：
+- 本机环境已推进到“host 已安装、官方 CRX 已解包直启、live socket 已出现、最小 smoke 已跑通”：
 - `scripts/install-claude-in-chrome-host.ts` 已把 wrapper 和 Native Messaging manifest 安装到本机
-- `detectExtensionInstallationPortable()` 仍确认未发现 Claude Chrome 扩展
+- `claude-in-chrome:download-extension` 已把官方 CRX 解包到 `~/.claude/chrome/official-extension/unpacked`
+- `claude-in-chrome:launch-unpacked` 已在隔离 profile 下直启 Chrome
+- `claude-in-chrome:check` 当前返回 `READY`
+- `claude-in-chrome:smoke` 已完成 `tabs_context_mcp -> tabs_create_mcp` 最小闭环
 - readiness 诊断现在还会校验 manifest 指向的 wrapper 是否真实存在且可执行，避免“manifest 在，但目标已经坏掉”的假阳性
 - Opera 这种把 `Extensions/` 直接放在浏览器根目录的布局也已经纳入扩展探测
 
 ## 本机运行边界
 
-当前这台机器的剩余阻塞不是源码，而是扩展侧环境：
+当前这台机器已经验证过源码侧和浏览器侧的最小闭环，当前运行边界变成“本机环境已 ready，但仍依赖浏览器 profile / 扩展活跃状态”：
 
 - `/Applications/Google Chrome.app` 存在
 - Chrome profile 目录存在，项目内检测也能扫到 `Default` / `Profile 1`
 - `~/.claude/chrome/chrome-native-host` 已生成
 - Chrome/Brave/Arc/Edge/Chromium/Vivaldi/Opera 的 Native Messaging manifest 已安装
-- 但 Claude in Chrome 生产扩展 `fcoeoabgfenejglbffodgkkbkcdhcgfn` 仍未安装
+- Claude in Chrome 生产扩展 `fcoeoabgfenejglbffodgkkbkcdhcgfn` 已通过官方 CRX 解包并在隔离 profile 中直启
+- `claude-in-chrome:check` 已检测到扩展与 live socket
+- `claude-in-chrome:smoke` 已通过
 
 因此目前状态应定义为：
 
 - source restored
 - package boundary verified
 - server tool inventory verified
-- local runtime blocked only by missing browser extension
+- local runtime ready
+- optional local smoke passing
 
 ## 标准化安装命令
 
@@ -101,8 +107,8 @@ bun run claude-in-chrome:check
 注意：
 
 - `claude-in-chrome:check` 目前把“已安装扩展”定义为浏览器 profile 里能被常规探测到的扩展安装，或 live socket 已经起来。
-- 如果你使用的是 `claude-in-chrome:launch-unpacked` 这种临时解包运行方式，但扩展还没有把 native socket 保持起来，`check` 仍可能显示 `Extension not found` / `No live socket`。
-- 这不代表 native host 坏了，优先再跑一次 `bun run claude-in-chrome:ping-host` 区分 host 侧和浏览器侧。
+- `claude-in-chrome:launch-unpacked` 仍是隔离 profile 的实验路径，跨机器不保证一上来就是 `READY`。
+- 如果 `check` 还没到 `READY`，先跑一次 `bun run claude-in-chrome:ping-host` 区分 host 侧和浏览器侧，再确认扩展是否已登录并保持活跃。
 
 ## 标准化最小 smoke
 
@@ -118,23 +124,21 @@ bun run claude-in-chrome:smoke
 - 再通过 native socket 调 `tabs_context_mcp`
 - 然后调 `tabs_create_mcp`
 - 最后再次读取 tab context，确认运行时链路已经打通
+- 成功或失败时都会显式断开 native socket，避免 harness 因子进程残留而误判超时
 
 ## 官方 CRX 实验路径的当前结论
 
-当前这台机器已经得到两条新证据：
+当前这台机器已经得到三条关键证据：
 
 - `claude-in-chrome:ping-host` 可稳定通过，说明 wrapper、`--chrome-native-host` 入口和 socket listener 创建链路是通的
 - 官方 CRX 可以稳定下载、解包，并且 `manifest.key` 推导出的扩展 ID 仍然是生产 ID
+- `claude-in-chrome:check` 已返回 `READY`，且 `claude-in-chrome:smoke` 已通过
 
-但还没有得到第三条关键证据：
+这意味着当前剩余工作已经不是“能不能连上浏览器”，而是：
 
-- 浏览器侧没有稳定留下 live socket，因此 `claude-in-chrome:smoke` 仍不能通过
-
-这意味着当前剩余 blocker 已经不是源码缺口，而更像是：
-
-- 浏览器运行时没有进入“保持 native connection”状态
-- 需要登录/打开 side panel/完成扩展内部 onboarding
-- 或者 Chrome 对临时解包扩展与常规已安装扩展还有额外差异
+- 把本机成功路径固化为长期回归和文档
+- 继续审计与原 bundle 的细节差异，而不是误报源码 stub
+- 区分“环境未 ready”与“代码回归”这两类失败
 
 ## 当前仓库对 package 的直接依赖面
 

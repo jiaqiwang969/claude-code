@@ -130,7 +130,6 @@ export function hasMalformedTokens(
     const c = command[i]
     if (c === '\\' && !inSingle) {
       i++
-      continue
     }
     if (c === '"' && !inSingle) {
       doubleCount++
@@ -199,12 +198,10 @@ export function hasShellQuoteSingleQuoteBug(command: string): boolean {
     if (char === '\\' && !inSingleQuote) {
       // Skip the next character (it's escaped)
       i++
-      continue
     }
 
     if (char === '"' && !inSingleQuote) {
       inDoubleQuote = !inDoubleQuote
-      continue
     }
 
     if (char === "'" && !inDoubleQuote) {
@@ -257,7 +254,6 @@ export function hasShellQuoteSingleQuoteBug(command: string): boolean {
           return true
         }
       }
-      continue
     }
   }
 

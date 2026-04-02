@@ -552,7 +552,6 @@ export async function verifyApiKey(
           }),
         async anthropic => {
           const messages: MessageParam[] = [{ role: 'user', content: 'test' }]
-          // biome-ignore lint/plugin: API key verification is intentionally a minimal direct call
           await anthropic.beta.messages.create({
             model,
             max_tokens: 1,
@@ -861,7 +860,6 @@ export async function* executeNonStreamingRequest(
       )
 
       try {
-        // biome-ignore lint/plugin: non-streaming API call
         return await anthropic.beta.messages.create(
           {
             ...adjustedParams,
@@ -1507,11 +1505,11 @@ async function* queryModel(
   let start = Date.now()
   let attemptNumber = 0
   const attemptStartTimes: number[] = []
-  let stream: Stream<BetaRawMessageStreamEvent> | undefined = undefined
-  let streamRequestId: string | null | undefined = undefined
-  let clientRequestId: string | undefined = undefined
+  let stream: Stream<BetaRawMessageStreamEvent> | undefined
+  let streamRequestId: string | null | undefined
+  let clientRequestId: string | undefined
   // eslint-disable-next-line eslint-plugin-n/no-unsupported-features/node-builtins -- Response is available in Node 18+ and is used by the SDK
-  let streamResponse: Response | undefined = undefined
+  let streamResponse: Response | undefined
 
   // Release all stream resources to prevent native memory leaks.
   // The Response object holds native TLS/socket buffers that live outside the
@@ -1597,7 +1595,7 @@ async function* queryModel(
     const hasThinking =
       thinkingConfig.type !== 'disabled' &&
       !isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_THINKING)
-    let thinking: BetaMessageStreamParams['thinking'] | undefined = undefined
+    let thinking: BetaMessageStreamParams['thinking'] | undefined
 
     // IMPORTANT: Do not change the adaptive-vs-budget thinking selection below
     // without notifying the model launch DRI and research. This is a sensitive
@@ -1761,16 +1759,18 @@ async function* queryModel(
 
   const newMessages: AssistantMessage[] = []
   let ttftMs = 0
-  let partialMessage: BetaMessage | undefined = undefined
+  let partialMessage: BetaMessage | undefined
   const contentBlocks: (BetaContentBlock | ConnectorTextBlock)[] = []
   let usage: NonNullableUsage = EMPTY_USAGE
   let costUSD = 0
   let stopReason: BetaStopReason | null = null
+  let sawMessageStop = false
   let didFallBackToNonStreaming = false
   let fallbackMessage: AssistantMessage | undefined
+  let didTrackStreamingCost = false
   let maxOutputTokens = 0
-  let responseHeaders: globalThis.Headers | undefined = undefined
-  let research: unknown = undefined
+  let responseHeaders: globalThis.Headers | undefined
+  let research: unknown
   let isFastModeRequest = isFastMode // Keep separate state as it may change if falling back
   let isAdvisorInProgress = false
 
@@ -1819,7 +1819,6 @@ async function* queryModel(
         // Use raw stream instead of BetaMessageStream to avoid O(n²) partial JSON parsing
         // BetaMessageStream calls partialParse() on every input_json_delta, which we don't need
         // since we handle tool input accumulation ourselves
-        // biome-ignore lint/plugin: main conversation loop handles attribution separately
         const result = await anthropic.beta.messages
           .create(
             { ...params, stream: true },
@@ -2255,6 +2254,7 @@ async function* queryModel(
               usage as unknown as BetaUsage,
               options.model,
             )
+            didTrackStreamingCost = true
 
             const refusalMessage = getErrorMessageIfRefusal(
               part.delta.stop_reason,
@@ -2294,6 +2294,7 @@ async function* queryModel(
             break
           }
           case 'message_stop':
+            sawMessageStop = true
             break
         }
 
@@ -2348,11 +2349,14 @@ async function* queryModel(
       // structured output (--json-schema), the model calls a StructuredOutput tool
       // on turn 1, then on turn 2 responds with end_turn and no content blocks.
       // That's a legitimate empty response, not an incomplete stream.
-      if (!partialMessage || (newMessages.length === 0 && !stopReason)) {
+      if (
+        !partialMessage ||
+        (newMessages.length === 0 && !stopReason && !sawMessageStop)
+      ) {
         logForDebugging(
           !partialMessage
             ? 'Stream completed without receiving message_start event - triggering non-streaming fallback'
-            : 'Stream completed with message_start but no content blocks completed - triggering non-streaming fallback',
+            : 'Stream completed with message_start but no content blocks or terminal metadata - triggering non-streaming fallback',
           { level: 'error' },
         )
         logEvent('tengu_stream_no_events', {
@@ -2819,13 +2823,34 @@ async function* queryModel(
     // message_delta handler before any yield. Fallback pushes to newMessages
     // then yields, so tracking must be here to survive .return() at the yield.
     if (fallbackMessage) {
-      const fallbackUsage = fallbackMessage.message.usage as BetaMessageDeltaUsage
+      const fallbackUsage = fallbackMessage.message
+        .usage as BetaMessageDeltaUsage | undefined
       usage = updateUsage(EMPTY_USAGE, fallbackUsage)
       stopReason = fallbackMessage.message.stop_reason as BetaStopReason
-      const fallbackCost = calculateUSDCost(resolvedModel, fallbackUsage as unknown as BetaUsage)
+      // Synthetic fallback errors may omit usage entirely; preserve the
+      // assistant error message instead of throwing again during cost tracking.
+      if (fallbackUsage) {
+        const fallbackCost = calculateUSDCost(
+          resolvedModel,
+          fallbackUsage as unknown as BetaUsage,
+        )
+        costUSD += addToTotalSessionCost(
+          fallbackCost,
+          fallbackUsage as unknown as BetaUsage,
+          options.model,
+        )
+      }
+    } else if (!didTrackStreamingCost && newMessages.length > 0) {
+      // Some proxy streams end after content_block_stop without ever sending a
+      // terminal message_delta. Preserve the streamed turn's input-side cost
+      // instead of reporting a zero-cost success.
+      const streamedCost = calculateUSDCost(
+        resolvedModel,
+        usage as unknown as BetaUsage,
+      )
       costUSD += addToTotalSessionCost(
-        fallbackCost,
-        fallbackUsage as unknown as BetaUsage,
+        streamedCost,
+        usage as unknown as BetaUsage,
         options.model,
       )
     }

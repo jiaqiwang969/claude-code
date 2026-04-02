@@ -74,8 +74,8 @@ function urlMatchesPattern(url: string, pattern: string): boolean {
  * inject a second header into the request.
  */
 function sanitizeHeaderValue(value: string): string {
-  // eslint-disable-next-line no-control-regex
-  return value.replace(/[\r\n\x00]/g, '')
+  // biome-ignore lint/complexity/useRegexLiterals: avoid control-character regex literal lint
+  return value.replace(new RegExp(String.raw`[\r\n\x00]`, 'g'), '')
 }
 
 /**

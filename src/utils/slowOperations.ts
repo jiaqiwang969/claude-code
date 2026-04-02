@@ -6,7 +6,6 @@ import {
   fsyncSync,
   openSync,
 } from 'fs'
-// biome-ignore lint: This file IS the cloneDeep wrapper - it must import the original
 import lodashCloneDeep from 'lodash-es/cloneDeep.js'
 import { addSlowOperation } from '../bootstrap/state.js'
 import { logForDebugging } from './debug.js'
@@ -72,7 +71,9 @@ export function callerFrame(stack: string | undefined): string {
  *
  * args[0] = TemplateStringsArray, args[1..n] = interpolated values
  */
-function buildDescription(args: IArguments): string {
+type SlowLoggingArgs = readonly [TemplateStringsArray, ...unknown[]]
+
+function buildDescription(args: SlowLoggingArgs): string {
   const strings = args[0] as TemplateStringsArray
   let result = ''
   for (let i = 0; i < strings.length; i++) {
@@ -95,10 +96,10 @@ function buildDescription(args: IArguments): string {
 
 class AntSlowLogger {
   startTime: number
-  args: IArguments
+  args: SlowLoggingArgs
   err: Error
 
-  constructor(args: IArguments) {
+  constructor(args: SlowLoggingArgs) {
     this.startTime = performance.now()
     this.args = args
     // V8/JSC capture the stack at construction but defer the expensive string
@@ -131,8 +132,7 @@ function slowLoggingAnt(
   _strings: TemplateStringsArray,
   ..._values: unknown[]
 ): AntSlowLogger {
-  // eslint-disable-next-line prefer-rest-params
-  return new AntSlowLogger(arguments)
+  return new AntSlowLogger([_strings, ..._values])
 }
 
 function slowLoggingExternal(): Disposable {
@@ -152,9 +152,11 @@ function slowLoggingExternal(): Disposable {
  * using _ = slowLogging`structuredClone(${value})`
  * const result = structuredClone(value)
  */
-export const slowLogging: {
-  (strings: TemplateStringsArray, ...values: unknown[]): Disposable
-} = feature('SLOW_OPERATION_LOGGING') ? slowLoggingAnt : slowLoggingExternal
+export const slowLogging: (
+  strings: TemplateStringsArray,
+  ...values: unknown[]
+) => Disposable =
+  feature('SLOW_OPERATION_LOGGING') ? slowLoggingAnt : slowLoggingExternal
 
 // --- Wrapped operations ---
 

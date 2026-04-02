@@ -32,7 +32,7 @@ export function AutoModeOptInDialog(t0) {
   let t2;
   if ($[1] !== onAccept || $[2] !== onDecline) {
     t2 = function onChange(value) {
-      bb3: switch (value) {
+      switch (value) {
         case "accept":
           {
             logEvent("tengu_auto_mode_opt_in_dialog_accept", {});
@@ -40,7 +40,7 @@ export function AutoModeOptInDialog(t0) {
               skipAutoPermissionPrompt: true
             });
             onAccept();
-            break bb3;
+            break;
           }
         case "accept-default":
           {
@@ -52,7 +52,7 @@ export function AutoModeOptInDialog(t0) {
               }
             });
             onAccept();
-            break bb3;
+            break;
           }
         case "decline":
           {

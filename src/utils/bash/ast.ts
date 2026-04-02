@@ -250,8 +250,8 @@ const BRACE_EXPANSION_RE = /\{[^{}\s]*(,|\.\.)[^{}\s]*\}/
  * default IFS does not include CR, so tree-sitter and bash disagree on
  * word boundaries.
  */
-// eslint-disable-next-line no-control-regex
-const CONTROL_CHAR_RE = /[\x00-\x08\x0B-\x1F\x7F]/
+// biome-ignore lint/complexity/useRegexLiterals: avoid control-character regex literal lint
+const CONTROL_CHAR_RE = new RegExp(String.raw`[\x00-\x08\x0B-\x1F\x7F]`)
 
 /**
  * Unicode whitespace beyond ASCII. These render invisibly (or as regular
@@ -720,7 +720,7 @@ function collectCommands(
         child.type === 'select' ||
         child.type === ';'
       ) {
-        continue // structural tokens
+        // structural tokens
       } else if (child.type === 'command_substitution') {
         // `for i in $(seq 1 3)` — inner cmd IS extracted and rule-checked.
         const err = collectCommandSubstitution(child, commands, varScope)
@@ -1792,7 +1792,6 @@ function walkVariableAssignment(
       // node. Without this case it falls through to walkArgument below
       // → tooComplex on unknown type `+=`.
       isAppend = child.type === '+='
-      continue
     } else if (child.type === 'command_substitution') {
       // $() as the variable's value. The output becomes a STRING stored in
       // the variable — it's NOT a positional argument (no path/flag concern).
@@ -1899,7 +1898,9 @@ function walkVariableAssignment(
       return {
         kind: 'too-complex',
         reason:
-          'PS4 value outside safe charset — only ${VAR} refs and [A-Za-z0-9 _+:.=/[]-] allowed',
+          'PS4 value outside safe charset — only ' +
+          '${' +
+          'VAR} refs and [A-Za-z0-9 _+:.=/[]-] allowed',
         nodeType: 'variable_assignment',
       }
     }

@@ -660,6 +660,8 @@ export class QueryEngine {
 
     // Track current message usage (reset on each message_start)
     let currentMessageUsage: NonNullableUsage = EMPTY_USAGE
+    let hasPendingCurrentMessageUsage = false
+    let sawCompletedContentBlockForCurrentMessage = false
     let turnCount = 1
     let hasAcknowledgedInitialMessages = false
     // Track structured output from StructuredOutput tool calls
@@ -675,6 +677,17 @@ export class QueryEngine {
     const initialStructuredOutputCalls = jsonSchema
       ? countToolCalls(this.mutableMessages, SYNTHETIC_OUTPUT_TOOL_NAME)
       : 0
+
+    const flushCurrentMessageUsage = (force: boolean = false) => {
+      if (!hasPendingCurrentMessageUsage) {
+        return
+      }
+      if (!force && !sawCompletedContentBlockForCurrentMessage) {
+        return
+      }
+      this.totalUsage = accumulateUsage(this.totalUsage, currentMessageUsage)
+      hasPendingCurrentMessageUsage = false
+    }
 
     for await (const message of query({
       messages,
@@ -771,6 +784,17 @@ export class QueryEngine {
           const stopReason = msg.message?.stop_reason as string | null | undefined
           if (stopReason != null) {
             lastStopReason = stopReason
+            // Non-streaming fallback responses arrive as fully-formed
+            // assistant messages with final usage already attached, but they
+            // do not emit stream_event/message_stop. Preserve that turn's
+            // usage here so result.usage stays in sync with cost/modelUsage.
+            this.totalUsage = accumulateUsage(
+              this.totalUsage,
+              updateUsage(
+                EMPTY_USAGE,
+                msg.message?.usage as BetaMessageDeltaUsage | undefined,
+              ),
+            )
           }
           this.mutableMessages.push(msg)
           yield* normalizeMessage(msg)
@@ -800,13 +824,21 @@ export class QueryEngine {
         case 'stream_event': {
           const event = (message as unknown as { event: Record<string, unknown> }).event
           if (event.type === 'message_start') {
+            // Defensive flush for malformed streams that yielded assistant
+            // content but never sent message_stop before starting another turn.
+            flushCurrentMessageUsage()
             // Reset current message usage for new message
             currentMessageUsage = EMPTY_USAGE
+            hasPendingCurrentMessageUsage = true
+            sawCompletedContentBlockForCurrentMessage = false
             const eventMessage = event.message as { usage: BetaMessageDeltaUsage }
             currentMessageUsage = updateUsage(
               currentMessageUsage,
               eventMessage.usage,
             )
+          }
+          if (event.type === 'content_block_stop') {
+            sawCompletedContentBlockForCurrentMessage = true
           }
           if (event.type === 'message_delta') {
             currentMessageUsage = updateUsage(
@@ -823,11 +855,7 @@ export class QueryEngine {
             }
           }
           if (event.type === 'message_stop') {
-            // Accumulate current message usage into total
-            this.totalUsage = accumulateUsage(
-              this.totalUsage,
-              currentMessageUsage,
-            )
+            flushCurrentMessageUsage(true)
           }
 
           if (includePartialMessages) {
@@ -1103,6 +1131,11 @@ export class QueryEngine {
         await flushSessionStorage()
       }
     }
+
+    // Some gateways terminate after content_block_stop without sending
+    // message_stop. If assistant content was already yielded, preserve that
+    // turn's usage in the final result instead of silently under-reporting it.
+    flushCurrentMessageUsage()
 
     if (!isResultSuccessful(result, lastStopReason)) {
       yield {

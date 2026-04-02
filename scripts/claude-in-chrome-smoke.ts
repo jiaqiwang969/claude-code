@@ -80,6 +80,7 @@ try {
   if (error instanceof Error) {
     console.error(error.message)
   }
+  socketClient.disconnect()
   process.exit(1)
 }
 
@@ -111,7 +112,9 @@ if (updatedTabs.length < initialTabs.length) {
   console.error(
     'tabs_create_mcp did not preserve tab context as expected. Recheck the extension/runtime state.',
   )
+  socketClient.disconnect()
   process.exit(1)
 }
 
 console.log('Claude in Chrome smoke passed')
+socketClient.disconnect()

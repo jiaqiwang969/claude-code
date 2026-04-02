@@ -65,12 +65,15 @@ bun run build
 - 完成度矩阵：[`docs/COMPLETENESS_MATRIX.md`](docs/COMPLETENESS_MATRIX.md)
 - 偏离清单：[`docs/DIVERGENCE.md`](docs/DIVERGENCE.md)
 - 离线 smoke：`bun run smoke`
+- 离线单项也可跑：`bun run smoke -- --checks doctor,memory-command,context-command,hot-path-stubs,query-dynamic-requires`
 - 在线 smoke：`bun run smoke:online`
+- 列出在线 smoke 分组：`bun run smoke -- --list-groups`
+- 只跑某一组在线检查：`bun run smoke -- --online --groups tools-and-agent`
 - Chrome readiness：`bun run smoke -- --checks chrome-readiness`
 - Chrome runtime smoke：`bun run smoke -- --checks chrome-smoke`
 - Chrome 辅助脚本：`bun run claude-in-chrome:open-extension` / `bun run claude-in-chrome:install-host` / `bun run claude-in-chrome:check` / `bun run claude-in-chrome:ping-host` / `bun run claude-in-chrome:download-extension` / `bun run claude-in-chrome:launch-unpacked` / `bun run claude-in-chrome:smoke`
-- 只跑部分在线检查：`bun run smoke -- --online --checks api-basic,claude-md-context,bash-tool,read-tool,write-tool,edit-tool,notebook-edit-tool,grep-tool,glob-tool,agent-flow,webfetch-tool,websearch-tool,mcp-flow,mcp-http-auth-flow,mcp-http-headers-helper-flow,compact-flow,resume-flow`
-- GitHub Actions：`.github/workflows/ci.yml` 会跑离线 smoke；`.github/workflows/online-smoke.yml` 支持手动触发在线 smoke
+- 只跑部分在线检查：`bun run smoke -- --online --checks api-basic,api-retry,query-loop,streaming-fallback,permission-denial,error-max-turns,error-during-execution,error-max-structured-output-retries,error-max-budget,claude-md-context,bash-tool,read-tool,write-tool,edit-tool,notebook-edit-tool,grep-tool,glob-tool,agent-flow,webfetch-tool,websearch-tool,mcp-flow,mcp-http-auth-flow,mcp-http-headers-helper-flow,compact-flow,resume-flow`
+- GitHub Actions：`.github/workflows/ci.yml` 会跑离线 smoke；`.github/workflows/online-smoke.yml` 手动触发时默认按 3 组并行跑在线 smoke，也支持通过 `groups` 或 `checks` 输入改成自定义集合
 
 说明：
 
@@ -78,12 +81,20 @@ bun run build
 - 真实完成度、优先级和已知偏离，请以完成度矩阵和偏离清单为准。
 - 新增或修复一个模块时，建议同步更新矩阵，并至少补一条 smoke 或回归验证。
 - 多步工具 smoke 默认预算上限为 `$0.20`，低于这个值时可能会出现“工具已经跑完，但预算上限过低导致误报”的情况。
-- 当前离线 smoke 已覆盖 `doctor` 诊断屏渲染；在线 smoke 已覆盖 `CLAUDE.md` 自动上下文、`Agent/Task`、`NotebookEdit` 最小 notebook 单元替换、`WebFetch` 公开静态页抓取、`WebSearch` 结构化搜索结果回传、MCP 本地 stdio 资源读取、MCP HTTP + 静态 `Authorization` header 鉴权资源读取、MCP HTTP + `headersHelper` 鉴权资源读取、`/compact`、`--continue` 和 `--resume <session-id>` 的恢复路径。
-- 当前 smoke harness 额外支持 `chrome-readiness` 本机诊断；若浏览器、扩展或 live native socket 未准备好，会以 `skip` 而不是误报代码失败。
+- `write-tool / edit-tool / notebook-edit-tool` 这类多步在线 smoke 现在走专用超时 `SMOKE_MULTI_STEP_TOOL_TIMEOUT_MS`，默认 `180000` ms；其余检查仍沿用 `SMOKE_COMMAND_TIMEOUT_MS` 的默认 `120000` ms。
+- 手动触发 `.github/workflows/online-smoke.yml` 时，也可以直接覆盖 `command_timeout_ms` 和 `multi_step_timeout_ms`，不用再临时改 workflow 文件或仓库环境。
+- `.github/workflows/online-smoke.yml` 在 `checks` 和 `groups` 都留空时会默认并行跑 3 组：`api-and-session`、`tools-and-agent`、`integrations`；组内具体检查由 `scripts/smoke-test.ts` 的 `ONLINE_CHECK_GROUPS` 注册表统一定义。手动填写 `groups` 时会跑指定分组，填写 `checks` 时会直接跑指定检查集合。
+- 记账 smoke 默认仍要求最终 payload 的 `usage / total_cost_usd / modelUsage` 严格一致；但 `/compact`、`Agent/Task`、`WebFetch`、`WebSearch` 这些路径会把辅助模型、local agent 或 compaction 成本计入 `modelUsage`，而顶层 `usage` 只覆盖主会话，因此这些检查改为断言“顶层 `usage` 是 `modelUsage` 的子集，且 `total_cost_usd` 仍与 `modelUsage` 聚合成本一致”。
+- QueryEngine 的异常收尾也已有在线 smoke：本地假 Anthropic 返回“无 content block + `stop_reason=tool_use` / `stop_reason=stop_sequence` / 缺失 `stop_reason`”时，会稳定收口到 `error_during_execution`，并保留 turn-scoped 诊断前缀；其中 `missing stop_reason` 已修正为不再额外触发一次非流式 fallback 请求。
+- 真不完整的流式响应也已有独立在线 smoke：若第 1 次 `stream=true` 请求在 `content_block_stop / message_stop` 之前中断，当前实现会精确触发 1 次非流式恢复请求，并以正常 `success` 收口；对应恢复后的 `usage / total_cost_usd / modelUsage` 现在也已被 smoke 锁住。
+- 对“assistant 文本已产出，但 `message_delta / message_stop` 缺失”的 malformed success 流，当前实现已补齐 usage / total_cost_usd / modelUsage 的保留，不再出现文本成功但记账全 0 的结果。
+- `api-basic`、live `query-loop` 成功路径、本地假 Anthropic 的 `api-retry` / `streaming-fallback` / `error_during_execution`、以及真实模型路径里的 `permission-denial` / `error-max-turns`，现在都显式断言最终 payload 的 `usage / total_cost_usd / modelUsage` 完整且一致，避免后续回归只保行为、不保记账。
+- 当前离线 smoke 已覆盖 `doctor` 诊断屏渲染、PTY 会话下的交互式 `/memory` 选择器锚点，以及 0 API 成本的非交互 `/context` 摘要输出与 memory file 列表；同时 `hot-path-stubs` 会递归审计 `query.ts / QueryEngine.ts / context.ts / tools.ts / commands.ts / services/mcp/client.ts` 的静态 runtime import 图，并把 runtime stub、type-only stub 和默认 dormant stub 分开报告，避免把 `src/query/transitions.ts` 这类类型占位误判成当前主链路故障；`query-dynamic-requires` 则额外审计 `query.ts / QueryEngine.ts` 的动态 `require` 目标，当前默认构建结果是 `1 active real + 1 gated real + 7 dormant stub`，没有已启用分支命中 stub。在线 smoke 已覆盖最小 `stream-json` 主循环 `init -> assistant -> result` 成功路径和 `stop_reason=end_turn`，以及“assistant 已产出文本，但 `stop_reason` 缺失”或“assistant 文本块已闭合，但后续 terminal event 缺失”时仍保持单请求 success 的容错路径；另外还覆盖了本地假 Anthropic `429 + Retry-After` 驱动的 `api_retry` 事件、重复无效 `StructuredOutput` tool_use 触发的 `error_max_structured_output_retries` 收口、单轮本地响应超预算后的 `error_max_budget_usd` 收口、`dontAsk` 模式下 `permission_denials` 的最终结果归档、`error_max_turns` 收口、`CLAUDE.md` 自动上下文、`Agent/Task`、`NotebookEdit` 最小 notebook 单元替换、`WebFetch` 公开静态页抓取、`WebSearch` 结构化搜索结果回传、MCP 本地 stdio 资源读取、MCP HTTP + 静态 `Authorization` header 鉴权资源读取、MCP HTTP + `headersHelper` 鉴权资源读取、`/compact`、`--continue` 和 `--resume <session-id>` 的恢复路径。
+- 当前 smoke harness 额外支持 `chrome-readiness` 和 `chrome-smoke` 本机诊断；若浏览器、扩展或 live native socket 未准备好，会以 `skip` 而不是误报代码失败。
 - 浏览器特化 MCP（Claude in Chrome）的 workspace package 已从相邻 restored source 回填，源码层不再是 stub；当前 fork 还补上了 native host 安装/诊断/最小 smoke 脚本（`scripts/install-claude-in-chrome-host.ts`、`scripts/claude-in-chrome-check.ts`、`scripts/claude-in-chrome-smoke.ts`），本机侧已可自动安装 wrapper + manifest。
-- 额外补了一条“官方 CRX 下载 -> 固定目录解包 -> 直启 Chrome”的实验辅助路径（`scripts/download-claude-in-chrome-extension.ts`、`scripts/launch-claude-in-chrome-unpacked.ts`）以及离线 host `ping/pong` 自检（`scripts/claude-in-chrome-ping-host.ts`）。当前验证结果是：host 自检已通过，官方 CRX 可稳定解包并直启 Chrome，但 live socket 仍未稳定出现，因此剩余问题已经收敛到浏览器运行时/登录/扩展内部状态，而不是源码 stub 或 native host 缺失。
+- 额外补了一条“官方 CRX 下载 -> 固定目录解包 -> 直启 Chrome”的实验辅助路径（`scripts/download-claude-in-chrome-extension.ts`、`scripts/launch-claude-in-chrome-unpacked.ts`）以及离线 host `ping/pong` 自检（`scripts/claude-in-chrome-ping-host.ts`）。当前本机验证结果已经推进到：host 自检通过、官方 CRX 可稳定解包并直启 Chrome、`claude-in-chrome:check` 返回 `READY`、`claude-in-chrome:smoke` 已完成 `tabs_context_mcp -> tabs_create_mcp` 最小闭环。此前 `chrome-smoke` 在 harness 里的超时也已确认是脚本进程收口问题，不是浏览器运行时未打通。
 - `WebSearch` smoke 只断言“工具被调起并返回结构化 hits”，不把外部搜索排序或模型最终自由生成回答当成稳定快照。
-- `/memory` 命令本身是 `local-jsx` 交互式编辑器，不属于稳定的 headless smoke 面；不要把它和运行时的 CLAUDE.md / memory 上下文加载混为一谈。
+- `/memory` 命令本身仍是 `local-jsx` 交互式编辑器，不存在 `-p` 直出的 headless 子命令；当前 smoke 用的是 PTY 驱动的真实交互探测，不要把它和运行时的 CLAUDE.md / memory 上下文加载混为一谈。后者现在分别由 `claude-md-context` 在线 smoke 和 `context-command` 离线 smoke 兜底。
 
 ## 相关文档及网站
 

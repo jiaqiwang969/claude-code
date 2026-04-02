@@ -3171,7 +3171,6 @@ async function scanPreBoundaryMetadata(
     const buf = resolveMetadataBuf(carry, chunkBuf)
     if (buf === null) {
       carry = null
-      continue
     }
 
     // Fast path: most chunks contain zero metadata markers. Skip line splitting.
@@ -4901,7 +4900,6 @@ function extractFirstPromptFromChunk(chunk: string): string {
         return result
       }
     } catch {
-      continue
     }
   }
   // Session started with a slash command but had no subsequent real message —
